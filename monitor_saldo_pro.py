@@ -108,10 +108,10 @@ class LiveBalance:
 
 @dataclass
 class Snapshot:
-    equity: pd.DataFrame
+    equity: pd.DataFrame  # serie principal (observada si existe)
+    equity_secondary: pd.DataFrame  # reconstrucción estimada desde CSV
     equity_recent: pd.DataFrame
     hourly_profile: pd.DataFrame
-    daily_close: pd.DataFrame
     cards: Dict[str, str]
     metrics: Dict[str, float]
     warnings: List[str]
@@ -182,6 +182,80 @@ class DataEngine:
 
         warnings.append("Saldo LIVE no detectado (LOG_SALDOS/log/txt opcional).")
         return LiveBalance()
+
+    def _extract_timestamp_from_line(self, line: str) -> Optional[datetime]:
+        patterns = [
+            r"(\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2})",
+            r"(\d{2}/\d{2}/\d{4}[ T]\d{2}:\d{2}:\d{2})",
+        ]
+        for pat in patterns:
+            m = re.search(pat, line)
+            if m:
+                try:
+                    dt = pd.to_datetime(m.group(1), errors="coerce", utc=True)
+                    if pd.notna(dt):
+                        return dt.to_pydatetime()
+                except Exception:
+                    pass
+        return None
+
+    def _read_observed_balance_series(self, view: str, warnings: List[str]) -> pd.DataFrame:
+        if view == "ALL":
+            # ALL se construye combinando REAL + DEMO observados si existen.
+            real = self._read_observed_balance_series("REAL", warnings)
+            demo = self._read_observed_balance_series("DEMO", warnings)
+            if real.empty and demo.empty:
+                return pd.DataFrame(columns=["timestamp", "equity"])
+            if real.empty:
+                return demo.rename(columns={"equity": "equity"})[["timestamp", "equity"]]
+            if demo.empty:
+                return real.rename(columns={"equity": "equity"})[["timestamp", "equity"]]
+            rr = real.rename(columns={"equity": "real"}).sort_values("timestamp")
+            dd = demo.rename(columns={"equity": "demo"}).sort_values("timestamp")
+            z = pd.merge_asof(rr, dd, on="timestamp", direction="nearest", tolerance=pd.Timedelta("12h"))
+            z["real"] = z["real"].ffill()
+            z["demo"] = z["demo"].ffill()
+            z["equity"] = (z["real"].fillna(0.0) + z["demo"].fillna(0.0)).astype(float)
+            return z[["timestamp", "equity"]].dropna(subset=["timestamp"])
+
+        tag = "REAL" if view == "REAL" else "DEMO"
+        regex = re.compile(rf"Saldo\s+cuenta\s+{tag}\s*:\s*([-\d\.,]+)\s*USD", flags=re.IGNORECASE)
+
+        candidates = [self.base_dir / LOG_SALDOS]
+        candidates.extend(sorted(self.base_dir.glob("*.log")))
+        candidates.extend(sorted(self.base_dir.glob("*.txt")))
+
+        rows: List[Tuple[datetime, float]] = []
+        for p in candidates:
+            if not p.exists() or not p.is_file():
+                continue
+            try:
+                lines = p.read_text(encoding="utf-8", errors="ignore").splitlines()
+            except Exception:
+                continue
+            if not lines:
+                continue
+            base_dt = datetime.fromtimestamp(p.stat().st_mtime, tz=timezone.utc) - timedelta(seconds=len(lines))
+            for idx, line in enumerate(lines):
+                m = regex.search(line)
+                if not m:
+                    continue
+                val = _safe_float(m.group(1))
+                if val is None or (isinstance(val, float) and not np.isfinite(val)):
+                    continue
+                ts = self._extract_timestamp_from_line(line)
+                if ts is None:
+                    ts = base_dt + timedelta(seconds=idx)
+                if ts.tzinfo is None:
+                    ts = ts.replace(tzinfo=timezone.utc)
+                rows.append((ts.astimezone(timezone.utc), float(val)))
+
+        if not rows:
+            return pd.DataFrame(columns=["timestamp", "equity"])
+
+        d = pd.DataFrame(rows, columns=["timestamp", "equity"]).sort_values("timestamp")
+        d = d.drop_duplicates(subset=["timestamp", "equity"], keep="last").reset_index(drop=True)
+        return d
 
     def _read_retiros(self, warnings: List[str]) -> pd.DataFrame:
         p = self.base_dir / "retiros.csv"
@@ -258,13 +332,17 @@ class DataEngine:
         if not files:
             warnings.append(f"No se encontraron CSV {CSV_PATTERN} en {self.base_dir}.")
             empty = pd.DataFrame(columns=["timestamp", "equity", "pnl"])
-            return Snapshot(empty, empty, empty, empty, {}, {}, warnings, view, _now_utc())
+            observed = self._read_observed_balance_series(view, warnings)
+            primary = observed if not observed.empty else empty
+            recent = primary[primary["timestamp"] >= (_now_utc() - timedelta(hours=VENTANA_HORAS))].copy() if not primary.empty else primary
+            return Snapshot(primary, empty, recent, pd.DataFrame(), {}, {}, warnings, view, _now_utc())
 
         dfs = [self._read_csv_robust(p, warnings) for p in files]
         data = pd.concat([d for d in dfs if not d.empty], ignore_index=True) if dfs else pd.DataFrame()
 
-        eq = self._build_equity(data, view=view, warnings=warnings)
-        eq = eq.sort_values("timestamp") if not eq.empty else eq
+        eq_est = self._build_equity(data, view=view, warnings=warnings)
+        eq_est = eq_est.sort_values("timestamp") if not eq_est.empty else eq_est
+        observed = self._read_observed_balance_series(view, warnings)
 
         live = self._read_live_balance(warnings)
         self.last_live = live
@@ -272,134 +350,52 @@ class DataEngine:
 
         now = _now_utc()
         rec_start = now - timedelta(hours=VENTANA_HORAS)
-        eq_recent = eq[eq["timestamp"] >= rec_start].copy() if not eq.empty else eq.copy()
 
-        hourly = pd.DataFrame(columns=["hour", "pnl_mean", "pnl_sum"])
-        daily = pd.DataFrame(columns=["date", "close"])
+        source = "ESTIMADO"
+        primary = eq_est[["timestamp", "equity"]].copy() if not eq_est.empty else pd.DataFrame(columns=["timestamp", "equity"])
+        if not observed.empty:
+            primary = observed.copy()
+            source = "OBSERVADO"
+            age = (now - observed["timestamp"].max().to_pydatetime()).total_seconds()
+            if age > STALE_SALDO_SEGUNDOS:
+                source = "STALE"
+
+        eq_recent = primary[primary["timestamp"] >= rec_start].copy() if not primary.empty else primary.copy()
+
+        hourly = pd.DataFrame(columns=["hour", "delta_sum"])
         cards: Dict[str, str] = {}
         metrics: Dict[str, float] = {}
 
-        if not eq.empty:
-            s = eq.set_index("timestamp")["equity"]
-            peak = float(s.max())
-            trough_recent = float(eq_recent["equity"].min()) if not eq_recent.empty else float(s.min())
-            current_recon = float(s.iloc[-1])
-            running_max = s.cummax()
-            dd = ((s - running_max) / running_max.replace(0, np.nan) * 100).fillna(0)
-            max_dd = float(dd.min()) if not dd.empty else 0.0
+        if not primary.empty:
+            s = primary.set_index("timestamp")["equity"].sort_index()
+            saldo_principal = float(s.iloc[-1])
+            s_recent = s[s.index >= rec_start]
+            chg1h = float(s_recent.iloc[-1] - s_recent.iloc[0]) if len(s_recent) > 1 else 0.0
+            estimado = float(eq_est["equity"].iloc[-1]) if not eq_est.empty else np.nan
 
-            h1 = now - timedelta(hours=1)
-            d0 = now.replace(hour=0, minute=0, second=0, microsecond=0)
-            s_h1 = s[s.index >= h1]
-            s_d = s[s.index >= d0]
-            chg1h = float(s_h1.iloc[-1] - s_h1.iloc[0]) if len(s_h1) > 1 else 0.0
-            chgday = float(s_d.iloc[-1] - s_d.iloc[0]) if len(s_d) > 1 else 0.0
-
-            pnl_by_trade = eq[["timestamp", "pnl"]].copy()
-            today = pnl_by_trade[pnl_by_trade["timestamp"] >= d0]
-            trades_today = int(len(today))
-            winrate_today = float((today["pnl"] > 0).mean() * 100) if trades_today > 0 else np.nan
-
-            h = eq.copy()
+            h = primary.copy().sort_values("timestamp")
+            h["delta"] = h["equity"].diff().fillna(0.0)
             h["hour"] = h["timestamp"].dt.hour
-            hourly = h.groupby("hour", as_index=False).agg(pnl_mean=("pnl", "mean"), pnl_sum=("pnl", "sum"))
-            if not hourly.empty:
-                best_hour = int(hourly.loc[hourly["pnl_sum"].idxmax(), "hour"])
-                worst_hour = int(hourly.loc[hourly["pnl_sum"].idxmin(), "hour"])
-            else:
-                best_hour = worst_hour = -1
-
-            dly = eq.copy()
-            dly["date"] = dly["timestamp"].dt.floor("D")
-            daily = dly.groupby("date", as_index=False).agg(close=("equity", "last"))
-            daily = daily.tail(DIAS_GRAFICA)
-
-            piso_operativo = trough_recent
-            colchon = max(0.0, current_recon - piso_operativo)
-            volatilidad = float(eq_recent["equity"].std()) if len(eq_recent) > 2 else 0.0
-            retiro_sugerido = max(0.0, colchon - (volatilidad * MARGEN_SEGURIDAD_COLCHON))
-
-            if len(eq_recent) > 10:
-                y = eq_recent["equity"].to_numpy()
-                xline = np.arange(len(y), dtype=float)
-                slope = np.polyfit(xline, y, 1)[0]
-                norm = np.std(y) + 1e-6
-                score = slope / norm
-                trend = "SUBIENDO" if score > 0.08 else ("BAJANDO" if score < -0.08 else "LATERAL")
-            else:
-                trend = "LATERAL"
-
-            draw_recent = 0.0
-            if not eq_recent.empty:
-                rs = eq_recent.set_index("timestamp")["equity"]
-                rm = rs.cummax()
-                draw_recent = float((((rs - rm) / rm.replace(0, np.nan)) * 100).min())
-
-            if colchon <= 0:
-                estado = "RIESGO"
-            elif draw_recent < -4:
-                estado = "TENSO"
-            elif retiro_sugerido > 0 and draw_recent > -2:
-                estado = "RETIRABLE"
-            elif draw_recent > -1.5:
-                estado = "ESTABLE"
-            else:
-                estado = "CONSERVADORA"
-
-            calidad = "NEUTRAL"
-            if chg1h > 0 and chgday > 0 and colchon > volatilidad:
-                calidad = "MOMENTO FUERTE"
-            elif chg1h < 0 and chgday < 0:
-                calidad = "MOMENTO DÉBIL"
-
-            live_val = live.real if view == "REAL" else (live.demo if view == "DEMO" else None)
-            source = "RECONSTRUIDO"
-            saldo_grande = current_recon
-            if live_val is not None:
-                age = (now - live.ts).total_seconds() if live.ts else 1e9
-                if age <= STALE_SALDO_SEGUNDOS:
-                    source = "LIVE"
-                    saldo_grande = live_val
-                else:
-                    source = "STALE"
-                    saldo_grande = live_val
-
-            diff_live_eq = (live_val - current_recon) if live_val is not None else np.nan
-            retiros_total = float(retiros["monto"].sum()) if not retiros.empty else 0.0
-            saldo_post_retiros = current_recon - retiros_total
+            hourly = h.groupby("hour", as_index=False).agg(delta_sum=("delta", "sum"))
 
             cards = {
-                "SALDO ACTUAL": _fmt_money(saldo_grande),
-                "ORIGEN": source,
+                "SALDO ACTUAL": _fmt_money(saldo_principal),
+                "FUENTE": source,
                 "VISTA": view,
-                "PICO HISTÓRICO": _fmt_money(peak),
-                f"PISO {VENTANA_HORAS}H": _fmt_money(piso_operativo),
-                "DRAWDOWN MÁX": _fmt_pct(max_dd),
-                "CAMBIO 1H": _fmt_money(chg1h),
-                "CAMBIO DÍA": _fmt_money(chgday),
-                "TRADES HOY": str(trades_today),
-                "WINRATE HOY": _fmt_pct(winrate_today),
-                "MEJOR HORA": f"{best_hour:02d}:00" if best_hour >= 0 else "--",
-                "PEOR HORA": f"{worst_hour:02d}:00" if worst_hour >= 0 else "--",
-                "TENDENCIA": trend,
-                "COLCHÓN RETIRABLE": _fmt_money(retiro_sugerido),
-                "ZONA ACTUAL": estado,
-                "DIF LIVE-EQ": _fmt_money(diff_live_eq),
-                "CALIDAD MOMENTO": calidad,
-                "RETIROS ACUM": _fmt_money(retiros_total),
-                "SALDO POST-RETIROS": _fmt_money(saldo_post_retiros),
+                "ÚLTIMA ACTUALIZACIÓN": s.index[-1].strftime("%Y-%m-%d %H:%M:%S UTC"),
+                "CAMBIO 9H": _fmt_money(chg1h),
+                "EQUITY ESTIMADO (CSV)": _fmt_money(estimado),
             }
-
             metrics = {
-                "current_recon": current_recon,
-                "current_display": saldo_grande,
-                "pico": peak,
-                "piso_operativo": piso_operativo,
-                "retiro_sugerido": retiro_sugerido,
-                "techo_reciente": float(eq_recent["equity"].max()) if not eq_recent.empty else peak,
+                "current_display": saldo_principal,
             }
+        else:
+            warnings.append("Sin serie de saldo observado ni equity estimado para graficar.")
 
-        return Snapshot(eq, eq_recent, hourly, daily, cards, metrics, warnings, view, now)
+        if observed.empty and not eq_est.empty:
+            warnings.append("Mostrando saldo ESTIMADO por CSV (no se halló historial observado en logs/txt).")
+
+        return Snapshot(primary, eq_est, eq_recent, hourly, cards, metrics, warnings, view, now)
 
 
 class MetricCard(QtWidgets.QFrame):
@@ -435,7 +431,7 @@ class DashboardWindow(QtWidgets.QMainWindow):
         root.setContentsMargins(8, 8, 8, 8)
         root.setSpacing(8)
 
-        self.balance_title = QtWidgets.QLabel("SALDO ACTUAL")
+        self.balance_title = QtWidgets.QLabel("SALDO REAL ACTUAL")
         self.balance_title.setObjectName("BalanceTitle")
         self.balance_value = QtWidgets.QLabel("--")
         self.balance_value.setObjectName("BalanceValue")
@@ -456,15 +452,13 @@ class DashboardWindow(QtWidgets.QMainWindow):
         root.addWidget(self.cards_widget)
 
         self.card_order = [
-            "ORIGEN", "VISTA", "PICO HISTÓRICO", f"PISO {VENTANA_HORAS}H", "DRAWDOWN MÁX", "CAMBIO 1H",
-            "CAMBIO DÍA", "TRADES HOY", "WINRATE HOY", "MEJOR HORA", "PEOR HORA", "TENDENCIA",
-            "COLCHÓN RETIRABLE", "ZONA ACTUAL", "DIF LIVE-EQ", "CALIDAD MOMENTO", "RETIROS ACUM", "SALDO POST-RETIROS"
+            "FUENTE", "VISTA", "ÚLTIMA ACTUALIZACIÓN", "CAMBIO 9H", "EQUITY ESTIMADO (CSV)"
         ]
         self.cards: Dict[str, MetricCard] = {}
         for i, k in enumerate(self.card_order):
             card = MetricCard(k)
             self.cards[k] = card
-            r, c = divmod(i, 6)
+            r, c = divmod(i, 5)
             self.cards_grid.addWidget(card, r, c)
 
         self.graphics = pg.GraphicsLayoutWidget()
@@ -483,11 +477,6 @@ class DashboardWindow(QtWidgets.QMainWindow):
         self.p_hour = self.graphics.addPlot(row=1, col=1)
         self.p_hour.setTitle("Comportamiento por Hora del Día")
         self.p_hour.showGrid(x=True, y=True, alpha=0.2)
-
-        axis_daily = pg.DateAxisItem(orientation="bottom")
-        self.p_daily = self.graphics.addPlot(row=2, col=0, colspan=2, axisItems={"bottom": axis_daily})
-        self.p_daily.setTitle("Cierre Diario")
-        self.p_daily.showGrid(x=True, y=True, alpha=0.2)
 
         self.warning_label = QtWidgets.QLabel("")
         self.warning_label.setObjectName("WarningLabel")
@@ -563,7 +552,6 @@ class DashboardWindow(QtWidgets.QMainWindow):
             self.p_main.enableAutoRange()
             self.p_recent.enableAutoRange()
             self.p_hour.enableAutoRange()
-            self.p_daily.enableAutoRange()
         elif k == QtCore.Qt.Key_Q:
             self.close()
         else:
@@ -572,7 +560,7 @@ class DashboardWindow(QtWidgets.QMainWindow):
     def _plot_main(self, snap: Snapshot):
         self.p_main.clear()
         if snap.equity.empty:
-            self.p_main.setTitle("Curva Principal Equity / Balance (sin datos)")
+            self.p_main.setTitle("Curva Principal Saldo Observado / Estimado (sin datos)")
             return
         x = (snap.equity["timestamp"].astype("int64") / 1e9).to_numpy(dtype=float)
         y = snap.equity["equity"].to_numpy(dtype=float)
@@ -596,6 +584,11 @@ class DashboardWindow(QtWidgets.QMainWindow):
             i_min = int(np.argmin(y_recent))
             self.p_main.plot([x_recent[i_max]], [y_recent[i_max]], pen=None, symbol="t", symbolBrush="#4cff9d", symbolSize=11)
             self.p_main.plot([x_recent[i_min]], [y_recent[i_min]], pen=None, symbol="t1", symbolBrush="#ff6e6e", symbolSize=11)
+
+        if not snap.equity_secondary.empty:
+            xs = (snap.equity_secondary["timestamp"].astype("int64") / 1e9).to_numpy(dtype=float)
+            ys = snap.equity_secondary["equity"].to_numpy(dtype=float)
+            self.p_main.plot(xs, ys, pen=pg.mkPen("#d6d6d6", width=1.2, style=QtCore.Qt.DashLine))
 
     def _plot_recent(self, snap: Snapshot):
         self.p_recent.clear()
@@ -623,19 +616,11 @@ class DashboardWindow(QtWidgets.QMainWindow):
             return
         h = snap.hourly_profile.sort_values("hour")
         x = h["hour"].to_numpy(dtype=float)
-        y = h["pnl_sum"].to_numpy(dtype=float)
+        y = h["delta_sum"].to_numpy(dtype=float)
         brushes = [pg.mkBrush("#4cd964" if v >= 0 else "#ff5c5c") for v in y]
         bars = pg.BarGraphItem(x=x, height=y, width=0.8, brushes=brushes)
         self.p_hour.addItem(bars)
         self.p_hour.plot(x, pd.Series(y).rolling(3, center=True, min_periods=1).mean().to_numpy(), pen=pg.mkPen("#78b8ff", width=2))
-
-    def _plot_daily(self, snap: Snapshot):
-        self.p_daily.clear()
-        if snap.daily_close.empty:
-            return
-        x = (snap.daily_close["date"].astype("int64") / 1e9).to_numpy(dtype=float)
-        y = snap.daily_close["close"].to_numpy(dtype=float)
-        self.p_daily.plot(x, y, pen=pg.mkPen("#ffd166", width=2.2), symbol="o", symbolSize=6, symbolBrush="#ffd166")
 
     def update_dashboard(self, force: bool = False):
         if self.paused and not force:
@@ -645,7 +630,7 @@ class DashboardWindow(QtWidgets.QMainWindow):
             saldo_txt = snap.cards.get("SALDO ACTUAL", "--")
             self.balance_value.setText(saldo_txt)
 
-            src = snap.cards.get("ORIGEN", "RECONSTRUIDO")
+            src = snap.cards.get("FUENTE", "ESTIMADO")
             state = "PAUSADO" if self.paused else "LIVE"
             self.status_line.setText(
                 f"Estado: {state} | Última actualización: {snap.update_ts.strftime('%Y-%m-%d %H:%M:%S UTC')} | Fuente saldo grande: {src}"
@@ -657,7 +642,6 @@ class DashboardWindow(QtWidgets.QMainWindow):
             self._plot_main(snap)
             self._plot_recent(snap)
             self._plot_hourly(snap)
-            self._plot_daily(snap)
 
             if snap.warnings:
                 self.warning_label.setText("⚠ " + " | ".join(snap.warnings[:4]))
