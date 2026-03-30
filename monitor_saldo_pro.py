@@ -63,7 +63,7 @@ VENTANA_HORAS = 9
 DIAS_GRAFICA = 14
 REFRESH_SEGUNDOS = 5
 LOG_SALDOS = "LOG_SALDOS"
-FULLSCREEN_INICIAL = True
+FULLSCREEN_INICIAL = False
 STALE_SALDO_SEGUNDOS = 120
 MARGEN_SEGURIDAD_COLCHON = 0.25
 
@@ -140,6 +140,7 @@ class DataEngine:
     def __init__(self, base_dir: Path):
         self.base_dir = base_dir
         self.last_live = LiveBalance()
+        self.last_observed_trace = ""
 
     def discover_csv(self) -> List[Path]:
         files = sorted([Path(p) for p in glob.glob(str(self.base_dir / CSV_PATTERN))])
@@ -236,13 +237,14 @@ class DataEngine:
             return z[["timestamp", "equity"]].dropna(subset=["timestamp"])
 
         tag = "REAL" if view == "REAL" else "DEMO"
-        regex = re.compile(rf"Saldo\s+cuenta\s+{tag}\s*:\s*([-\d\.,]+)\s*USD", flags=re.IGNORECASE)
+        regex = re.compile(rf"Saldo\s+cuenta\s+{tag}\s*:\s*([-\d\.,]+)(?:\s*USD)?", flags=re.IGNORECASE)
 
         candidates = [self.base_dir / LOG_SALDOS]
         candidates.extend(sorted(self.base_dir.glob("*.log")))
         candidates.extend(sorted(self.base_dir.glob("*.txt")))
 
         rows: List[Tuple[datetime, float]] = []
+        file_hits: Dict[str, int] = {}
         for p in candidates:
             if not p.exists() or not p.is_file():
                 continue
@@ -266,10 +268,13 @@ class DataEngine:
                 if ts.tzinfo is None:
                     ts = ts.replace(tzinfo=timezone.utc)
                 rows.append((ts.astimezone(timezone.utc), float(val)))
+                file_hits[p.name] = file_hits.get(p.name, 0) + 1
 
         if not rows:
+            self.last_observed_trace = f"{tag}: 0 coincidencias en {len(candidates)} archivos revisados"
             return pd.DataFrame(columns=["timestamp", "equity"])
 
+        self.last_observed_trace = f"{tag}: {len(rows)} coincidencias ({file_hits})"
         d = pd.DataFrame(rows, columns=["timestamp", "equity"]).sort_values("timestamp")
         d = d.drop_duplicates(subset=["timestamp", "equity"], keep="last").reset_index(drop=True)
         return d
@@ -369,15 +374,17 @@ class DataEngine:
 
         source = "SALDO ESTIMADO"
         primary = eq_est[["timestamp", "equity"]].copy() if not eq_est.empty else pd.DataFrame(columns=["timestamp", "equity"])
-        observed_reliable = len(observed) >= 2
+        observed_reliable = len(observed) >= 1
         if observed_reliable:
             primary = observed.copy()
             source = "SALDO OBSERVADO"
             age = (now - observed["timestamp"].max().to_pydatetime()).total_seconds()
             if age > STALE_SALDO_SEGUNDOS:
                 source = "SALDO STALE"
-        elif not observed.empty:
-            warnings.append("Historial observado parcial (muy pocos puntos); se usa LIVE si está disponible.")
+            if len(observed) < 3:
+                warnings.append("Historial observado parcial (pocos puntos), pero se prioriza SALDO OBSERVADO.")
+        else:
+            warnings.append(f"Sin coincidencias observadas para {view}. Trace: {self.last_observed_trace}")
 
         live_val = live.real if view == "REAL" else (live.demo if view == "DEMO" else None)
         if source == "SALDO ESTIMADO" and live_val is not None and np.isfinite(live_val):
@@ -419,6 +426,10 @@ class DataEngine:
 
         if source == "SALDO ESTIMADO" and not eq_est.empty:
             warnings.append("Sin saldo observado ni LIVE suficiente: mostrando SALDO ESTIMADO desde CSV.")
+        elif source == "SALDO LIVE":
+            warnings.append("Usando SALDO LIVE por ausencia de historial observado suficiente.")
+        else:
+            warnings.append(f"Trace observado activo: {self.last_observed_trace}")
 
         return Snapshot(primary, eq_est, eq_recent, hourly, cards, metrics, warnings, view, now)
 
@@ -520,7 +531,7 @@ class DashboardWindow(QtWidgets.QMainWindow):
         self.timer.start(max(1000, int(REFRESH_SEGUNDOS * 1000)))
 
         if FULLSCREEN_INICIAL:
-            self.showFullScreen()
+            self.showMaximized()
 
         self.startup_check()
         self.update_dashboard()
@@ -655,9 +666,9 @@ class DashboardWindow(QtWidgets.QMainWindow):
             self.balance_value.setText(saldo_txt)
 
             src = snap.cards.get("FUENTE SALDO", "SALDO ESTIMADO")
-            state = "PAUSADO" if self.paused else "LIVE"
+            refresh_state = "PAUSADO" if self.paused else "ACTIVO"
             self.status_line.setText(
-                f"Estado: {state} | HORA ACTUAL: {datetime.now(timezone.utc).strftime('%H:%M:%S UTC')} | Fuente saldo grande: {src}"
+                f"REFRESCO: {refresh_state} | FUENTE SALDO: {src} | HORA ACTUAL: {datetime.now(timezone.utc).strftime('%H:%M:%S UTC')}"
             )
 
             for k, card in self.cards.items():
