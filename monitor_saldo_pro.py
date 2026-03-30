@@ -311,16 +311,31 @@ class DashboardWindow(QtWidgets.QMainWindow):
         root.setContentsMargins(8, 8, 8, 8)
         root.setSpacing(8)
 
+        top_row = QtWidgets.QHBoxLayout()
         self.lbl_title = QtWidgets.QLabel("SALDO REAL DERIV ACTUAL")
         self.lbl_title.setObjectName("Title")
+        self.lbl_source = QtWidgets.QLabel("FUENTE: --")
+        self.lbl_source.setObjectName("BadgeNeutral")
+        top_row.addWidget(self.lbl_title, 1)
+        top_row.addWidget(self.lbl_source, 0)
+        root.addLayout(top_row)
+
         self.lbl_big = QtWidgets.QLabel("--")
         self.lbl_big.setObjectName("Big")
-        self.lbl_meta = QtWidgets.QLabel("FUENTE SALDO: -- | REFRESCO: ACTIVO | HORA ACTUAL: -- | ÚLTIMA ACT: --")
-        self.lbl_meta.setObjectName("Meta")
-
-        root.addWidget(self.lbl_title)
+        self.lbl_big.setAlignment(QtCore.Qt.AlignCenter)
         root.addWidget(self.lbl_big)
-        root.addWidget(self.lbl_meta)
+
+        meta_row = QtWidgets.QHBoxLayout()
+        self.lbl_refresh = QtWidgets.QLabel("REFRESCO: ACTIVO")
+        self.lbl_refresh.setObjectName("MetaBox")
+        self.lbl_now = QtWidgets.QLabel("HORA ACTUAL: --")
+        self.lbl_now.setObjectName("MetaBox")
+        self.lbl_last = QtWidgets.QLabel("ÚLTIMA ACT: --")
+        self.lbl_last.setObjectName("MetaBox")
+        meta_row.addWidget(self.lbl_refresh)
+        meta_row.addWidget(self.lbl_now)
+        meta_row.addWidget(self.lbl_last)
+        root.addLayout(meta_row)
 
         self.graphics = pg.GraphicsLayoutWidget()
         root.addWidget(self.graphics, 1)
@@ -351,9 +366,13 @@ class DashboardWindow(QtWidgets.QMainWindow):
         self.setStyleSheet(
             """
             QMainWindow, QWidget { background: #0b0f14; color: #d9e2f2; }
-            #Title { font-size: 16px; color: #8aa4cf; font-weight: 600; }
-            #Big { font-size: 56px; color: #f1f6ff; font-weight: 800; }
-            #Meta { font-size: 13px; color: #a7c0e8; }
+            #Title { font-size: 18px; color: #9ec2ff; font-weight: 700; letter-spacing: 0.4px; }
+            #Big { font-size: 76px; color: #ffffff; font-weight: 900; padding: 8px 0; }
+            #MetaBox { font-size: 13px; color: #cde0ff; background: #132034; border: 1px solid #23415f; border-radius: 8px; padding: 6px 10px; }
+            #BadgeNeutral { font-size: 13px; color: #d9e2f2; background: #1c2a3a; border: 1px solid #415a75; border-radius: 12px; padding: 4px 10px; font-weight: 700; }
+            #BadgeGood { font-size: 13px; color: #06341c; background: #73f7b3; border: 1px solid #88ffc1; border-radius: 12px; padding: 4px 10px; font-weight: 800; }
+            #BadgeWarn { font-size: 13px; color: #3d2a00; background: #ffd67f; border: 1px solid #ffe09e; border-radius: 12px; padding: 4px 10px; font-weight: 800; }
+            #BadgeBad { font-size: 13px; color: #3d0000; background: #ff8f8f; border: 1px solid #ffaaaa; border-radius: 12px; padding: 4px 10px; font-weight: 800; }
             #Warn { font-size: 12px; color: #ffb86b; }
             #Help { font-size: 11px; color: #9fb7d9; }
             """
@@ -410,13 +429,30 @@ class DashboardWindow(QtWidgets.QMainWindow):
             self.lbl_big.setText(_fmt_money(snap.saldo_actual))
             refresh_state = "PAUSADO" if self.paused else "ACTIVO"
             last = snap.last_update.strftime("%Y-%m-%d %H:%M:%S UTC") if snap.last_update else "--"
-            self.lbl_meta.setText(
-                f"FUENTE SALDO: {snap.source} | REFRESCO: {refresh_state} | HORA ACTUAL: {snap.now.strftime('%H:%M:%S UTC')} | ÚLTIMA ACT: {last}"
-            )
+            self.lbl_refresh.setText(f"REFRESCO: {refresh_state}")
+            self.lbl_now.setText(f"HORA ACTUAL: {snap.now.strftime('%H:%M:%S UTC')}")
+            self.lbl_last.setText(f"ÚLTIMA ACT: {last}")
 
-            self._plot_series(self.p_min, snap.series_minutes, color="#7ee6ff")
-            self._plot_series(self.p_hour, snap.series_hours, color="#6cc5ff")
-            self._plot_series(self.p_day, snap.series_days, color="#66ffb2")
+            src = snap.source.upper().strip()
+            self.lbl_source.setText(f"FUENTE: {src}")
+            if src in ("MAESTRO", "OBSERVADO", "LIVE"):
+                self.lbl_source.setObjectName("BadgeGood")
+                self.lbl_big.setStyleSheet("color:#f7fff9;")
+            elif src == "STALE":
+                self.lbl_source.setObjectName("BadgeWarn")
+                self.lbl_big.setStyleSheet("color:#fff5df;")
+            elif src in ("ESTIMADO", "SIN DATOS REALES"):
+                self.lbl_source.setObjectName("BadgeBad")
+                self.lbl_big.setStyleSheet("color:#ffe9e9;")
+            else:
+                self.lbl_source.setObjectName("BadgeNeutral")
+                self.lbl_big.setStyleSheet("color:#f1f6ff;")
+            self.lbl_source.style().unpolish(self.lbl_source)
+            self.lbl_source.style().polish(self.lbl_source)
+
+            self._plot_series(self.p_min, snap.series_minutes, color="#66f3ff")
+            self._plot_series(self.p_hour, snap.series_hours, color="#66b7ff")
+            self._plot_series(self.p_day, snap.series_days, color="#7effb7")
 
             # curva estimada solo auxiliar y tenue (si no hay real)
             if snap.series_minutes.empty and not snap.series_est.empty:
