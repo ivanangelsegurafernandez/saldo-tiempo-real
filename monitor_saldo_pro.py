@@ -142,7 +142,7 @@ class DataEngine:
     def _parse_timestamp(self, df: pd.DataFrame, warnings: List[str]) -> pd.Series:
         ts = pd.Series(pd.NaT, index=df.index, dtype="datetime64[ns, UTC]")
         if "fecha" in df.columns:
-            t = pd.to_datetime(df["fecha"], errors="coerce", utc=True, infer_datetime_format=True)
+            t = pd.to_datetime(df["fecha"], errors="coerce", utc=True)
             ts = ts.fillna(t)
         if "ts" in df.columns:
             t = pd.to_datetime(df["ts"], errors="coerce", utc=True)
@@ -574,7 +574,7 @@ class DashboardWindow(QtWidgets.QMainWindow):
         if snap.equity.empty:
             self.p_main.setTitle("Curva Principal Equity / Balance (sin datos)")
             return
-        x = snap.equity["timestamp"].astype("int64") / 1e9
+        x = (snap.equity["timestamp"].astype("int64") / 1e9).to_numpy(dtype=float)
         y = snap.equity["equity"].to_numpy(dtype=float)
 
         curve = self.p_main.plot(x, y, pen=pg.mkPen("#5ad4ff", width=2.5), name="Equity")
@@ -583,25 +583,25 @@ class DashboardWindow(QtWidgets.QMainWindow):
         fill = pg.FillBetweenItem(curve, curve0, brush=pg.mkBrush(90, 180, 255, 45))
         self.p_main.addItem(fill)
 
-        self.p_main.plot([x.iloc[-1]], [y[-1]], pen=None, symbol="o", symbolSize=9, symbolBrush="#c6f56e")
+        self.p_main.plot([x[-1]], [y[-1]], pen=None, symbol="o", symbolSize=9, symbolBrush="#c6f56e")
         txt = pg.TextItem(f"{y[-1]:,.2f}", color="#e8f1ff", anchor=(0, 1))
-        txt.setPos(float(x.iloc[-1]), float(y[-1]))
+        txt.setPos(float(x[-1]), float(y[-1]))
         self.p_main.addItem(txt)
 
         if len(y) > 2:
             ridx = max(0, len(y) - 300)
             y_recent = y[ridx:]
-            x_recent = x.iloc[ridx:]
+            x_recent = x[ridx:]
             i_max = int(np.argmax(y_recent))
             i_min = int(np.argmin(y_recent))
-            self.p_main.plot([x_recent.iloc[i_max]], [y_recent[i_max]], pen=None, symbol="t", symbolBrush="#4cff9d", symbolSize=11)
-            self.p_main.plot([x_recent.iloc[i_min]], [y_recent[i_min]], pen=None, symbol="t1", symbolBrush="#ff6e6e", symbolSize=11)
+            self.p_main.plot([x_recent[i_max]], [y_recent[i_max]], pen=None, symbol="t", symbolBrush="#4cff9d", symbolSize=11)
+            self.p_main.plot([x_recent[i_min]], [y_recent[i_min]], pen=None, symbol="t1", symbolBrush="#ff6e6e", symbolSize=11)
 
     def _plot_recent(self, snap: Snapshot):
         self.p_recent.clear()
         if snap.equity_recent.empty:
             return
-        x = snap.equity_recent["timestamp"].astype("int64") / 1e9
+        x = (snap.equity_recent["timestamp"].astype("int64") / 1e9).to_numpy(dtype=float)
         y = snap.equity_recent["equity"].to_numpy(dtype=float)
         self.p_recent.plot(x, y, pen=pg.mkPen("#77e3ff", width=2.0))
 
@@ -633,7 +633,7 @@ class DashboardWindow(QtWidgets.QMainWindow):
         self.p_daily.clear()
         if snap.daily_close.empty:
             return
-        x = snap.daily_close["date"].astype("int64") / 1e9
+        x = (snap.daily_close["date"].astype("int64") / 1e9).to_numpy(dtype=float)
         y = snap.daily_close["close"].to_numpy(dtype=float)
         self.p_daily.plot(x, y, pen=pg.mkPen("#ffd166", width=2.2), symbol="o", symbolSize=6, symbolBrush="#ffd166")
 
