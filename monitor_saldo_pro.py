@@ -188,8 +188,10 @@ class DataEngine:
 
             real = None
             demo = None
-            rr = re.findall(r"Saldo\s+cuenta\s+REAL(?:\s*\([^)]*\))?\s*:\s*([\d\.,]+)", txt, flags=re.IGNORECASE)
-            dr = re.findall(r"Saldo\s+cuenta\s+DEMO(?:\s*\([^)]*\))?\s*:\s*([\d\.,]+)", txt, flags=re.IGNORECASE)
+            rr = re.findall(r"SALDO\s+EN\s+CUENTA\s+REAL\s+DERIV\s*:\s*([-\d\.,]+)(?:\s*USD)?", txt, flags=re.IGNORECASE)
+            if not rr:
+                rr = re.findall(r"Saldo\s+cuenta\s+REAL(?:\s*\([^)]*\))?\s*:\s*([-\d\.,]+)(?:\s*USD)?", txt, flags=re.IGNORECASE)
+            dr = re.findall(r"Saldo\s+cuenta\s+DEMO(?:\s*\([^)]*\))?\s*:\s*([-\d\.,]+)(?:\s*USD)?", txt, flags=re.IGNORECASE)
             if rr:
                 real = _safe_float(rr[-1])
             if dr:
@@ -237,10 +239,15 @@ class DataEngine:
             return z[["timestamp", "equity"]].dropna(subset=["timestamp"])
 
         tag = "REAL" if view == "REAL" else "DEMO"
-        regex = re.compile(
-            rf"Saldo\s+cuenta\s+{tag}(?:\s*\([^)]*\))?\s*:\s*([-\d\.,]+)(?:\s*USD)?",
-            flags=re.IGNORECASE,
-        )
+        if tag == "REAL":
+            patterns = [
+                re.compile(r"SALDO\s+EN\s+CUENTA\s+REAL\s+DERIV\s*:\s*([-\d\.,]+)(?:\s*USD)?", flags=re.IGNORECASE),
+                re.compile(r"Saldo\s+cuenta\s+REAL(?:\s*\([^)]*\))?\s*:\s*([-\d\.,]+)(?:\s*USD)?", flags=re.IGNORECASE),
+            ]
+        else:
+            patterns = [
+                re.compile(r"Saldo\s+cuenta\s+DEMO(?:\s*\([^)]*\))?\s*:\s*([-\d\.,]+)(?:\s*USD)?", flags=re.IGNORECASE),
+            ]
 
         candidates = [self.base_dir / LOG_SALDOS]
         candidates.extend(sorted(self.base_dir.glob("*.log")))
@@ -259,8 +266,12 @@ class DataEngine:
                 continue
             base_dt = datetime.fromtimestamp(p.stat().st_mtime, tz=timezone.utc) - timedelta(seconds=len(lines))
             for idx, line in enumerate(lines):
-                m = regex.search(line)
-                if not m:
+                m = None
+                for pat in patterns:
+                    m = pat.search(line)
+                    if m:
+                        break
+                if m is None:
                     continue
                 val = _safe_float(m.group(1))
                 if val is None or (isinstance(val, float) and not np.isfinite(val)):
