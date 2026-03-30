@@ -38,6 +38,7 @@ Teclas:
 from __future__ import annotations
 
 import glob
+import json
 import math
 import os
 import re
@@ -141,6 +142,25 @@ class DataEngine:
         self.base_dir = base_dir
         self.last_live = LiveBalance()
         self.last_observed_trace = ""
+
+    def _read_master_live_file(self, view: str, warnings: List[str]) -> Optional[Tuple[float, datetime]]:
+        p = self.base_dir / "saldo_real_live.json"
+        if not p.exists():
+            return None
+        try:
+            obj = json.loads(p.read_text(encoding="utf-8", errors="ignore"))
+            val = obj.get("saldo_real")
+            ts_raw = obj.get("timestamp")
+            v = _safe_float(val, default=np.nan)
+            if not np.isfinite(v):
+                return None
+            ts = pd.to_datetime(ts_raw, errors="coerce", utc=True) if ts_raw else pd.NaT
+            if pd.isna(ts):
+                ts = pd.to_datetime(p.stat().st_mtime, unit="s", utc=True)
+            return float(v), ts.to_pydatetime()
+        except Exception as e:
+            warnings.append(f"No se pudo leer saldo_real_live.json: {e}")
+            return None
 
     def discover_csv(self) -> List[Path]:
         files = sorted([Path(p) for p in glob.glob(str(self.base_dir / CSV_PATTERN))])
@@ -379,6 +399,7 @@ class DataEngine:
         eq_est = self._build_equity(data, view=view, warnings=warnings)
         eq_est = eq_est.sort_values("timestamp") if not eq_est.empty else eq_est
         observed = self._read_observed_balance_series(view, warnings)
+        master_live = self._read_master_live_file(view, warnings)
 
         live = self._read_live_balance(warnings)
         self.last_live = live
@@ -388,8 +409,18 @@ class DataEngine:
 
         source = "ESTIMADO"
         primary = eq_est[["timestamp", "equity"]].copy() if not eq_est.empty else pd.DataFrame(columns=["timestamp", "equity"])
+        if view == "REAL" and master_live is not None:
+            mv, mts = master_live
+            source = "MAESTRO"
+            if not observed.empty:
+                primary = observed.copy()
+                primary = pd.concat([primary, pd.DataFrame([{"timestamp": mts, "equity": mv}])], ignore_index=True)
+                primary = primary.sort_values("timestamp").drop_duplicates(subset=["timestamp"], keep="last")
+            else:
+                primary = pd.DataFrame([{"timestamp": mts, "equity": mv}])
+
         observed_reliable = len(observed) >= 1
-        if observed_reliable:
+        if source != "MAESTRO" and observed_reliable:
             primary = observed.copy()
             source = "REAL OBSERVADO"
             age = (now - observed["timestamp"].max().to_pydatetime()).total_seconds()
@@ -397,7 +428,7 @@ class DataEngine:
                 source = "STALE"
             if len(observed) < 3:
                 warnings.append("Historial observado parcial (pocos puntos), pero se prioriza SALDO OBSERVADO.")
-        else:
+        elif source != "MAESTRO":
             warnings.append(f"Sin coincidencias observadas para {view}. Trace: {self.last_observed_trace}")
 
         live_val = live.real if view == "REAL" else (live.demo if view == "DEMO" else None)
@@ -442,6 +473,8 @@ class DataEngine:
             warnings.append("Sin saldo observado ni LIVE suficiente: mostrando ESTIMADO desde CSV.")
         elif source == "LIVE":
             warnings.append("Usando LIVE por ausencia de historial observado suficiente.")
+        elif source == "MAESTRO":
+            warnings.append("Usando saldo persistido del MAESTRO como fuente principal.")
         else:
             warnings.append(f"Trace observado activo: {self.last_observed_trace}")
 
