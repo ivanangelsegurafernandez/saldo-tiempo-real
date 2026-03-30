@@ -188,8 +188,8 @@ class DataEngine:
 
             real = None
             demo = None
-            rr = re.findall(r"Saldo\s+cuenta\s+REAL\s*:\s*([\d\.,]+)", txt, flags=re.IGNORECASE)
-            dr = re.findall(r"Saldo\s+cuenta\s+DEMO\s*:\s*([\d\.,]+)", txt, flags=re.IGNORECASE)
+            rr = re.findall(r"Saldo\s+cuenta\s+REAL(?:\s*\([^)]*\))?\s*:\s*([\d\.,]+)", txt, flags=re.IGNORECASE)
+            dr = re.findall(r"Saldo\s+cuenta\s+DEMO(?:\s*\([^)]*\))?\s*:\s*([\d\.,]+)", txt, flags=re.IGNORECASE)
             if rr:
                 real = _safe_float(rr[-1])
             if dr:
@@ -237,7 +237,10 @@ class DataEngine:
             return z[["timestamp", "equity"]].dropna(subset=["timestamp"])
 
         tag = "REAL" if view == "REAL" else "DEMO"
-        regex = re.compile(rf"Saldo\s+cuenta\s+{tag}\s*:\s*([-\d\.,]+)(?:\s*USD)?", flags=re.IGNORECASE)
+        regex = re.compile(
+            rf"Saldo\s+cuenta\s+{tag}(?:\s*\([^)]*\))?\s*:\s*([-\d\.,]+)(?:\s*USD)?",
+            flags=re.IGNORECASE,
+        )
 
         candidates = [self.base_dir / LOG_SALDOS]
         candidates.extend(sorted(self.base_dir.glob("*.log")))
@@ -372,25 +375,25 @@ class DataEngine:
         now = _now_utc()
         rec_start = now - timedelta(hours=VENTANA_HORAS)
 
-        source = "SALDO ESTIMADO"
+        source = "ESTIMADO"
         primary = eq_est[["timestamp", "equity"]].copy() if not eq_est.empty else pd.DataFrame(columns=["timestamp", "equity"])
         observed_reliable = len(observed) >= 1
         if observed_reliable:
             primary = observed.copy()
-            source = "SALDO OBSERVADO"
+            source = "REAL OBSERVADO"
             age = (now - observed["timestamp"].max().to_pydatetime()).total_seconds()
             if age > STALE_SALDO_SEGUNDOS:
-                source = "SALDO STALE"
+                source = "STALE"
             if len(observed) < 3:
                 warnings.append("Historial observado parcial (pocos puntos), pero se prioriza SALDO OBSERVADO.")
         else:
             warnings.append(f"Sin coincidencias observadas para {view}. Trace: {self.last_observed_trace}")
 
         live_val = live.real if view == "REAL" else (live.demo if view == "DEMO" else None)
-        if source == "SALDO ESTIMADO" and live_val is not None and np.isfinite(live_val):
+        if source == "ESTIMADO" and live_val is not None and np.isfinite(live_val):
             ts_live = live.ts if live.ts else now
             primary = pd.DataFrame([{"timestamp": ts_live, "equity": float(live_val)}])
-            source = "SALDO LIVE"
+            source = "LIVE"
 
         eq_recent = primary[primary["timestamp"] >= rec_start].copy() if not primary.empty else primary.copy()
 
@@ -424,10 +427,10 @@ class DataEngine:
         else:
             warnings.append("Sin serie de saldo observado ni equity estimado para graficar.")
 
-        if source == "SALDO ESTIMADO" and not eq_est.empty:
-            warnings.append("Sin saldo observado ni LIVE suficiente: mostrando SALDO ESTIMADO desde CSV.")
-        elif source == "SALDO LIVE":
-            warnings.append("Usando SALDO LIVE por ausencia de historial observado suficiente.")
+        if source == "ESTIMADO" and not eq_est.empty:
+            warnings.append("Sin saldo observado ni LIVE suficiente: mostrando ESTIMADO desde CSV.")
+        elif source == "LIVE":
+            warnings.append("Usando LIVE por ausencia de historial observado suficiente.")
         else:
             warnings.append(f"Trace observado activo: {self.last_observed_trace}")
 
@@ -467,7 +470,7 @@ class DashboardWindow(QtWidgets.QMainWindow):
         root.setContentsMargins(8, 8, 8, 8)
         root.setSpacing(8)
 
-        self.balance_title = QtWidgets.QLabel("SALDO REAL ACTUAL")
+        self.balance_title = QtWidgets.QLabel("SALDO REAL DERIV ACTUAL")
         self.balance_title.setObjectName("BalanceTitle")
         self.balance_value = QtWidgets.QLabel("--")
         self.balance_value.setObjectName("BalanceValue")
@@ -502,12 +505,14 @@ class DashboardWindow(QtWidgets.QMainWindow):
 
         axis_main = SmartDateAxis(orientation="bottom")
         self.p_main = self.graphics.addPlot(row=0, col=0, colspan=2, axisItems={"bottom": axis_main})
-        self.p_main.setTitle("Saldo vs Tiempo")
+        self.p_main.setTitle("Tiempo vs Dinero (USD)")
+        self.p_main.setLabel("left", "Dinero (USD)")
         self.p_main.showGrid(x=True, y=True, alpha=0.08)
 
         axis_recent = SmartDateAxis(orientation="bottom")
         self.p_recent = self.graphics.addPlot(row=1, col=0, axisItems={"bottom": axis_recent})
-        self.p_recent.setTitle(f"VENTANA: ÚLTIMAS {VENTANA_HORAS} HORAS")
+        self.p_recent.setTitle(f"Últimas {VENTANA_HORAS} horas")
+        self.p_recent.setLabel("left", "Dinero (USD)")
         self.p_recent.showGrid(x=True, y=True, alpha=0.08)
 
         self.p_hour = self.graphics.addPlot(row=1, col=1)
@@ -665,7 +670,7 @@ class DashboardWindow(QtWidgets.QMainWindow):
             saldo_txt = snap.cards.get("SALDO ACTUAL", "--")
             self.balance_value.setText(saldo_txt)
 
-            src = snap.cards.get("FUENTE SALDO", "SALDO ESTIMADO")
+            src = snap.cards.get("FUENTE SALDO", "ESTIMADO")
             refresh_state = "PAUSADO" if self.paused else "ACTIVO"
             self.status_line.setText(
                 f"REFRESCO: {refresh_state} | FUENTE SALDO: {src} | HORA ACTUAL: {datetime.now(timezone.utc).strftime('%H:%M:%S UTC')}"
