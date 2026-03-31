@@ -79,10 +79,11 @@ class SmartDateAxis(pg.DateAxisItem):
     def tickStrings(self, values, scale, spacing):
         if not values:
             return []
+        local_tz = datetime.now().astimezone().tzinfo
         span = max(values) - min(values)
         out = []
         for v in values:
-            dt = datetime.fromtimestamp(v, tz=timezone.utc)
+            dt = datetime.fromtimestamp(v, tz=local_tz)
             if span <= 6 * 3600:
                 out.append(dt.strftime("%H:%M"))
             elif span <= 48 * 3600:
