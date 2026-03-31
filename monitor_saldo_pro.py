@@ -63,6 +63,7 @@ Y_AXIS_MIN_USD = float(os.getenv("Y_AXIS_MIN_USD", "0"))
 Y_AXIS_MAX_USD = float(os.getenv("Y_AXIS_MAX_USD", "300"))
 Y_AUTO_SPAN_USD = float(os.getenv("Y_AUTO_SPAN_USD", "120"))
 CAPITAL_BASE_USD = float(os.getenv("CAPITAL_BASE_USD", "0") or "0")
+MIN_X_SPAN_SECONDS = 20.0
 
 
 
@@ -592,10 +593,13 @@ class DashboardWindow(QtWidgets.QMainWindow):
 
         meta = QtWidgets.QHBoxLayout(); meta.setSpacing(10)
         self.lbl_refresh = QtWidgets.QLabel("REFRESCO: ACTIVO"); self.lbl_refresh.setObjectName("MetaBox")
+        self.lbl_scale = QtWidgets.QLabel("ESCALA Y: --"); self.lbl_scale.setObjectName("MetaBox")
         self.lbl_now = QtWidgets.QLabel("HORA LOCAL: --"); self.lbl_now.setObjectName("MetaNow")
         self.lbl_last = QtWidgets.QLabel("ÚLTIMA ACT: --"); self.lbl_last.setObjectName("MetaLast")
-        self.lbl_build = QtWidgets.QLabel(f"BUILD: {MONITOR_BUILD_ID}"); self.lbl_build.setObjectName("MetaBox")
-        meta.addWidget(self.lbl_refresh); meta.addWidget(self.lbl_now, 1); meta.addWidget(self.lbl_last); meta.addWidget(self.lbl_build)
+        meta.addWidget(self.lbl_refresh)
+        meta.addWidget(self.lbl_scale)
+        meta.addWidget(self.lbl_now, 1)
+        meta.addWidget(self.lbl_last)
         hl.addLayout(meta)
         root.addWidget(header)
 
@@ -611,9 +615,10 @@ class DashboardWindow(QtWidgets.QMainWindow):
         self._style_plot(self.p_day, "DÍAS · tendencia")
 
         self.plot_states = {
-            "main": self._init_plot_state(self.p_main, "#5df2ff", "#d9fbff"),
-            "min": self._init_plot_state(self.p_min, "#3fe9ff", "#c6f7ff"),
-            "day": self._init_plot_state(self.p_day, "#7ff0b9", "#dcffe9"),
+            "main": self._init_plot_state(self.p_main, "#5df2ff", "#d9fbff", VENTANA_DIAS * 86400),
+            "min": self._init_plot_state(self.p_min, "#3fe9ff", "#c6f7ff", VENTANA_MINUTOS * 60),
+            "hour": self._init_plot_state(self.p_hour, "#7aa6ff", "#dae3ff", VENTANA_HORAS * 3600),
+            "day": self._init_plot_state(self.p_day, "#7ff0b9", "#dcffe9", VENTANA_DIAS * 86400),
         }
 
         self.lbl_warn = QtWidgets.QLabel(""); self.lbl_warn.setObjectName("Warn"); root.addWidget(self.lbl_warn)
@@ -656,41 +661,65 @@ class DashboardWindow(QtWidgets.QMainWindow):
         for ax in (plot.getAxis("left"), plot.getAxis("bottom")):
             ax.setTextPen(pg.mkPen("#b9d0ee")); ax.setPen(pg.mkPen("#35506f"))
         plot.addLegend(offset=(5, 5), labelTextSize="7pt")
-        y0, y1 = self._resolve_y_range(None)
+        y0, y1, _ = self._resolve_y_range(None)
         plot.setYRange(y0, y1, padding=0.0)
         plot.setLimits(yMin=y0, yMax=y1)
 
-    def _resolve_y_range(self, y: Optional[np.ndarray]) -> Tuple[float, float]:
+    def _resolve_y_range(self, y: Optional[np.ndarray]) -> Tuple[float, float, str]:
         if Y_SCALE_MODE == "manual":
-            return float(Y_AXIS_MIN_USD), float(Y_AXIS_MAX_USD)
+            ymin = float(min(Y_AXIS_MIN_USD, Y_AXIS_MAX_USD))
+            ymax = float(max(Y_AXIS_MIN_USD, Y_AXIS_MAX_USD))
+            if ymax - ymin < 0.01:
+                ymax = ymin + 1.0
+            return ymin, ymax, f"manual · min={ymin:,.2f} max={ymax:,.2f}"
         if Y_SCALE_MODE == "capital":
             if CAPITAL_BASE_USD > 0:
                 base = float(CAPITAL_BASE_USD)
             elif y is not None and len(y) > 0:
                 base = float(max(1.0, np.nanmedian(y)))
             else:
-                base = 100.0
-            band = max(8.0, base * 0.60)
-            y0 = max(0.0, base - band * 0.35)
+                base = 10.0
+            data_span = 0.0
+            if y is not None and len(y) > 1:
+                data_span = float(max(0.0, np.nanmax(y) - np.nanmin(y)))
+            band = max(2.0, base * 0.35, data_span * 2.5)
+            y0 = max(0.0, base - band * 0.5)
             y1 = y0 + band
-            return y0, y1
+            return y0, y1, f"capital · base={base:,.2f} span={band:,.2f}"
         if y is None or len(y) == 0:
-            return 0.0, float(max(10.0, Y_AUTO_SPAN_USD))
+            span = float(max(10.0, Y_AUTO_SPAN_USD))
+            return 0.0, span, f"auto · span={span:,.2f}"
         center = float(np.nanmedian(y))
         span = float(max(10.0, Y_AUTO_SPAN_USD))
         y0 = max(0.0, center - span * 0.5)
         y1 = y0 + span
-        return y0, y1
+        return y0, y1, f"auto · span={span:,.2f}"
 
-    def _init_plot_state(self, plot: pg.PlotItem, color: str, endpoint: str) -> Dict[str, object]:
+    def _init_plot_state(self, plot: pg.PlotItem, color: str, endpoint: str, canonical_window_s: int) -> Dict[str, object]:
         glow = plot.plot([], [], pen=pg.mkPen(color + "55", width=8.0), name=None)
-        line = plot.plot([], [], pen=pg.mkPen(color, width=4.8), name="Equity")
-        last = plot.plot([], [], pen=None, symbol="o", symbolSize=6, symbolBrush=endpoint, name=None)
+        line = plot.plot([], [], pen=pg.mkPen(color, width=5.2), name="Equity")
+        last = plot.plot([], [], pen=None, symbol="o", symbolSize=5, symbolBrush=endpoint, name=None)
         vmax = plot.plot([], [], pen=None, symbol="o", symbolSize=4, symbolBrush="#ffd36b99", name=None)
         vmin = plot.plot([], [], pen=None, symbol="o", symbolSize=4, symbolBrush="#ff8f8f99", name=None)
         txt = pg.TextItem(text="", color="#9ec2ff", anchor=(0, 1))
         plot.addItem(txt)
-        return {"plot": plot, "glow": glow, "line": line, "last": last, "max": vmax, "min": vmin, "text": txt}
+        return {"plot": plot, "glow": glow, "line": line, "last": last, "max": vmax, "min": vmin, "text": txt, "canonical_window_s": int(canonical_window_s)}
+
+    def _set_x_range_visible(self, plot: pg.PlotItem, x: np.ndarray, canonical_window_s: int):
+        if len(x) == 0:
+            return
+        xmin = float(np.nanmin(x))
+        xmax = float(np.nanmax(x))
+        span = max(0.0, xmax - xmin)
+        if len(x) == 1:
+            pad = max(MIN_X_SPAN_SECONDS, canonical_window_s * 0.02)
+            plot.setXRange(xmin - pad, xmax + pad, padding=0.0)
+            return
+        if span < float(canonical_window_s):
+            pad = max(MIN_X_SPAN_SECONDS, span * 0.08, canonical_window_s * 0.01)
+            plot.setXRange(xmin - pad, xmax + pad, padding=0.0)
+        else:
+            plot.setXRange(xmax - float(canonical_window_s), xmax, padding=0.0)
 
     def keyPressEvent(self, ev: QtGui.QKeyEvent):
         k = ev.key()
@@ -717,7 +746,7 @@ class DashboardWindow(QtWidgets.QMainWindow):
             self.timer.setInterval(int(interval * 1000))
         super().changeEvent(ev)
 
-    def _update_plot_state(self, state: Dict[str, object], s: pd.DataFrame):
+    def _update_plot_state(self, state: Dict[str, object], s: pd.DataFrame) -> str:
         plot = state["plot"]
         glow = state["glow"]; line = state["line"]; last = state["last"]; vmax = state["max"]; vmin = state["min"]; txt = state["text"]
         s = _sanitize_series_for_plot(s)
@@ -727,8 +756,8 @@ class DashboardWindow(QtWidgets.QMainWindow):
             last.setData([], [])
             vmax.setData([], [])
             vmin.setData([], [])
-            txt.setText("")
-            return
+            txt.setText("Sin puntos")
+            return "sin datos"
 
         x = (s["timestamp"].astype("int64") / 1e9).to_numpy(dtype=float)
         y = s["equity"].to_numpy(dtype=float)
@@ -740,9 +769,9 @@ class DashboardWindow(QtWidgets.QMainWindow):
         else:
             glow.setData([], [])
             line.setData([], [])
-            txt.setText("")
+            txt.setText("1 punto: esperando más histórico")
 
-        marker_size = 8 if len(x) == 1 else 6
+        marker_size = 8 if len(x) == 1 else 4
         if SHOW_LAST_MARKER:
             last.setData([x[-1]], [y[-1]], symbolSize=marker_size)
         else:
@@ -754,8 +783,10 @@ class DashboardWindow(QtWidgets.QMainWindow):
         else:
             vmax.setData([], [])
             vmin.setData([], [])
-        y0, y1 = self._resolve_y_range(y)
+        y0, y1, scale_info = self._resolve_y_range(y)
         plot.setYRange(y0, y1, padding=0.0)
+        self._set_x_range_visible(plot, x, int(state["canonical_window_s"]))
+        return scale_info
 
     def refresh(self, force: bool = False):
         if self.paused and not force:
@@ -789,17 +820,18 @@ class DashboardWindow(QtWidgets.QMainWindow):
                 self.lbl_source.setObjectName("BadgeNeutral"); self.lbl_big.setStyleSheet("color:#d8e7ff;")
             self.lbl_source.style().unpolish(self.lbl_source); self.lbl_source.style().polish(self.lbl_source)
 
-            self._update_plot_state(self.plot_states["main"], snap.series_main)
+            main_scale = self._update_plot_state(self.plot_states["main"], snap.series_main)
             self._update_plot_state(self.plot_states["min"], snap.series_minutes)
             self._update_plot_state(self.plot_states["day"], snap.series_days)
+            self.lbl_scale.setText(f"ESCALA Y: {main_scale}")
 
             if snap.warnings:
                 compact = [w.strip()[:110] + ("…" if len(w.strip()) > 110 else "") for w in snap.warnings[:3]]
                 self.lbl_warn.setText("⚠ " + " · ".join(compact))
-                self.lbl_warn.setToolTip("\n".join(snap.warnings))
+                self.lbl_warn.setToolTip("\n".join(snap.warnings + [f"Escala efectiva: {main_scale}"]))
             else:
                 self.lbl_warn.setText("")
-                self.lbl_warn.setToolTip("")
+                self.lbl_warn.setToolTip(f"Escala efectiva: {main_scale}")
         except Exception as e:
             self.lbl_warn.setText(f"⚠ Error monitor: {e}")
             traceback.print_exc()
