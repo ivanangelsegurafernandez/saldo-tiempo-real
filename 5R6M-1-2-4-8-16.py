@@ -1369,6 +1369,7 @@ reinicio_manual = False
 LIMPIEZA_PANEL_HASTA = 0
 ULTIMA_ACT_SALDO = 0
 REFRESCO_SALDO = 12
+SALDO_HISTORY_HEARTBEAT_S = 15
 HUD_RENDER_MIN_INTERVAL_S = 1.20
 HUD_LAST_RENDER_TS = 0.0
 HUD_LAST_RENDER_SIG = ""
@@ -15596,9 +15597,10 @@ def _set_saldo_status(status: str, reason: str, detail: str = "", announce: bool
 
 def _persistir_saldo_live():
     try:
+        now_utc = datetime.now(timezone.utc)
         payload = {
             "saldo_real": float(SALDO_LAST_VALID_VALUE) if SALDO_LAST_VALID_VALUE is not None else None,
-            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "timestamp": now_utc.isoformat(),
             "status": str(SALDO_STATUS),
             "source": "MAESTRO_DERIV",
             "last_valid_ts": float(SALDO_LAST_VALID_TS or 0.0),
@@ -15624,6 +15626,7 @@ def _persistir_saldo_live():
                         except Exception:
                             pass
         should_append = True
+        append_reason = "change"
         if isinstance(last_obj, dict):
             try:
                 same_balance = float(last_obj.get("saldo_real")) == float(payload.get("saldo_real"))
@@ -15631,8 +15634,23 @@ def _persistir_saldo_live():
                 same_balance = False
             same_status = str(last_obj.get("status", "")) == str(payload.get("status", ""))
             same_source = str(last_obj.get("source", "")) == str(payload.get("source", ""))
-            should_append = not (same_balance and same_status and same_source)
+            same_signature = same_balance and same_status and same_source
+            if same_signature:
+                elapsed = None
+                try:
+                    ts_raw = str(last_obj.get("timestamp", "")).strip()
+                    if ts_raw:
+                        ts_last = datetime.fromisoformat(ts_raw.replace("Z", "+00:00"))
+                        elapsed = (now_utc - ts_last).total_seconds()
+                except Exception:
+                    elapsed = None
+                should_append = elapsed is None or elapsed >= float(SALDO_HISTORY_HEARTBEAT_S)
+                append_reason = "heartbeat"
+            else:
+                should_append = True
+                append_reason = "change"
         if should_append:
+            payload["event_type"] = append_reason
             with open(hist_target, "a", encoding="utf-8") as hf:
                 hf.write(json.dumps(payload, ensure_ascii=False) + "\n")
                 hf.flush()
