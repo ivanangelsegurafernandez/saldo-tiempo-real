@@ -630,16 +630,17 @@ class DashboardWindow(QtWidgets.QMainWindow):
         plot.showGrid(x=True, y=True, alpha=0.05)
         for ax in (plot.getAxis("left"), plot.getAxis("bottom")):
             ax.setTextPen(pg.mkPen("#b9d0ee")); ax.setPen(pg.mkPen("#35506f"))
-        plot.addLegend(offset=(5, 5), labelTextSize="8pt")
+        plot.addLegend(offset=(5, 5), labelTextSize="7pt")
 
     def _init_plot_state(self, plot: pg.PlotItem, color: str, endpoint: str) -> Dict[str, object]:
-        line = plot.plot([], [], pen=pg.mkPen(color, width=4.2), name="Serie real")
-        last = plot.plot([], [], pen=None, symbol="o", symbolSize=13, symbolBrush=endpoint, name="Último")
-        vmax = plot.plot([], [], pen=None, symbol="t", symbolSize=12, symbolBrush="#ffd36b", name="Máximo")
-        vmin = plot.plot([], [], pen=None, symbol="t1", symbolSize=12, symbolBrush="#ff8f8f", name="Mínimo")
+        glow = plot.plot([], [], pen=pg.mkPen(color + "55", width=8.0), name=None)
+        line = plot.plot([], [], pen=pg.mkPen(color, width=4.8), name="Equity")
+        last = plot.plot([], [], pen=None, symbol="o", symbolSize=6, symbolBrush=endpoint, name=None)
+        vmax = plot.plot([], [], pen=None, symbol="o", symbolSize=4, symbolBrush="#ffd36b99", name=None)
+        vmin = plot.plot([], [], pen=None, symbol="o", symbolSize=4, symbolBrush="#ff8f8f99", name=None)
         txt = pg.TextItem(text="", color="#9ec2ff", anchor=(0, 1))
         plot.addItem(txt)
-        return {"plot": plot, "line": line, "last": last, "max": vmax, "min": vmin, "text": txt}
+        return {"plot": plot, "glow": glow, "line": line, "last": last, "max": vmax, "min": vmin, "text": txt}
 
     def keyPressEvent(self, ev: QtGui.QKeyEvent):
         k = ev.key()
@@ -668,33 +669,38 @@ class DashboardWindow(QtWidgets.QMainWindow):
 
     def _update_plot_state(self, state: Dict[str, object], s: pd.DataFrame):
         plot = state["plot"]
-        line = state["line"]; last = state["last"]; vmax = state["max"]; vmin = state["min"]; txt = state["text"]
+        glow = state["glow"]; line = state["line"]; last = state["last"]; vmax = state["max"]; vmin = state["min"]; txt = state["text"]
         s = _sanitize_series_for_plot(s)
         if s.empty:
+            glow.setData([], [])
             line.setData([], [])
             last.setData([], [])
             vmax.setData([], [])
             vmin.setData([], [])
-            txt.setText("Sin histórico real: 0 muestras válidas")
-            txt.setPos(0, 0)
+            txt.setText("")
             return
 
         x = (s["timestamp"].astype("int64") / 1e9).to_numpy(dtype=float)
         y = s["equity"].to_numpy(dtype=float)
 
         if len(x) >= MIN_POINTS_FOR_LINE:
+            glow.setData(x, y)
             line.setData(x, y)
             txt.setText("")
         else:
+            glow.setData([], [])
             line.setData([], [])
-            txt.setText("No se puede trazar línea: se requieren al menos 2 puntos")
-            txt.setPos(float(x[-1]), float(y[-1]))
+            txt.setText("")
 
-        marker_size = 18 if len(x) == 1 else 13
+        marker_size = 8 if len(x) == 1 else 6
         last.setData([x[-1]], [y[-1]], symbolSize=marker_size)
-        imax = int(np.argmax(y)); imin = int(np.argmin(y))
-        vmax.setData([x[imax]], [y[imax]])
-        vmin.setData([x[imin]], [y[imin]])
+        if len(x) >= 8:
+            imax = int(np.argmax(y)); imin = int(np.argmin(y))
+            vmax.setData([x[imax]], [y[imax]])
+            vmin.setData([x[imin]], [y[imin]])
+        else:
+            vmax.setData([], [])
+            vmin.setData([], [])
         y_recent = y[-min(len(y), 60):]
         q_low = float(np.nanpercentile(y_recent, 10))
         q_high = float(np.nanpercentile(y_recent, 90))
