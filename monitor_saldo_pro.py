@@ -86,6 +86,17 @@ def _fmt_local_ts(ts_obj) -> str:
     return "--"
 
 
+def _sanitize_series_for_plot(s: pd.DataFrame) -> pd.DataFrame:
+    if s is None or s.empty:
+        return pd.DataFrame(columns=["timestamp", "equity"])
+    d = s.copy()
+    d["timestamp"] = pd.to_datetime(d["timestamp"], errors="coerce", utc=True)
+    d["equity"] = pd.to_numeric(d["equity"], errors="coerce")
+    d = d.dropna(subset=["timestamp", "equity"]).sort_values("timestamp")
+    d = d.drop_duplicates(subset=["timestamp"], keep="last")
+    return d.reset_index(drop=True)
+
+
 def _safe_float(x, default=np.nan):
     try:
         if x is None:
@@ -106,6 +117,7 @@ class SmartDateAxis(pg.DateAxisItem):
             return ["" for _ in values]
         span = max(finite_vals) - min(finite_vals)
         out = []
+        last_label = None
         for v in values:
             try:
                 if not isinstance(v, (int, float, np.floating)) or not np.isfinite(v):
@@ -118,13 +130,18 @@ class SmartDateAxis(pg.DateAxisItem):
                 dt_utc = datetime.fromtimestamp(float(v), tz=timezone.utc)
                 dt_local = dt_utc.astimezone()
                 if span <= 15 * 60:
-                    out.append(dt_local.strftime("%H:%M:%S"))
+                    label = dt_local.strftime("%H:%M:%S")
                 elif span <= 6 * 3600:
-                    out.append(dt_local.strftime("%H:%M"))
+                    label = dt_local.strftime("%H:%M")
                 elif span <= 48 * 3600:
-                    out.append(dt_local.strftime("%d-%m %H:%M"))
+                    label = dt_local.strftime("%d-%m %H:%M")
                 else:
-                    out.append(dt_local.strftime("%d-%m"))
+                    label = dt_local.strftime("%d-%m")
+                if label == last_label:
+                    out.append("")
+                else:
+                    out.append(label)
+                    last_label = label
             except Exception:
                 out.append("")
         return out
@@ -539,6 +556,7 @@ class DashboardWindow(QtWidgets.QMainWindow):
 
         self.lbl_big = QtWidgets.QLabel("--"); self.lbl_big.setObjectName("Big")
         self.lbl_big.setAlignment(QtCore.Qt.AlignCenter); self.lbl_big.setMinimumHeight(118)
+        self.lbl_big.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Preferred)
         hl.addWidget(self.lbl_big)
 
         meta = QtWidgets.QHBoxLayout(); meta.setSpacing(10)
@@ -566,17 +584,17 @@ class DashboardWindow(QtWidgets.QMainWindow):
         }
 
         self.lbl_warn = QtWidgets.QLabel(""); self.lbl_warn.setObjectName("Warn"); root.addWidget(self.lbl_warn)
-        self.lbl_help = QtWidgets.QLabel("Teclas: [1]REAL [2]DEMO [3]ALL [F]Fullscreen [P]Pausa [R]Reset [Q]Salir")
+        self.lbl_help = QtWidgets.QLabel(f"Teclas: [1]REAL [2]DEMO [3]ALL [F]Fullscreen [P]Pausa [R]Reset [Q]Salir · {MONITOR_VERSION} · {MONITOR_BUILD_ID}")
         self.lbl_help.setObjectName("Help"); root.addWidget(self.lbl_help)
 
         self.setStyleSheet(
             """
             QMainWindow, QWidget { background: #0b0f14; color: #d9e2f2; }
             #HeaderCard { background: #0f1622; border: 1px solid #203047; border-radius: 14px; }
-            #Title { font-size: 20px; color: #b9d3ff; font-weight: 800; }
-            #Big { font-size: 98px; color: #ecfff3; font-weight: 900; padding: 10px 0 14px 0; }
+            #Title { font-size: 18px; color: #b9d3ff; font-weight: 780; }
+            #Big { font-size: 86px; color: #ecfff3; font-weight: 900; padding: 8px 0 10px 0; }
             #MetaBox { font-size: 14px; color: #bdd6ff; background: #101e31; border: 1px solid #263e5f; border-radius: 10px; padding: 8px 12px; }
-            #MetaNow { font-size: 18px; color: #ecf6ff; background: #153153; border: 1px solid #2f5e92; border-radius: 10px; padding: 8px 14px; font-weight: 800; }
+            #MetaNow { font-size: 16px; color: #ecf6ff; background: #153153; border: 1px solid #2f5e92; border-radius: 10px; padding: 8px 12px; font-weight: 780; }
             #MetaLast { font-size: 14px; color: #d9e8ff; background: #12263d; border: 1px solid #2c4b72; border-radius: 10px; padding: 8px 12px; }
             #BadgeMaster { font-size: 13px; color: #041d13; background: #72f8b1; border: 1px solid #9dffd0; border-radius: 13px; padding: 4px 11px; font-weight: 900; }
             #BadgeObserved { font-size: 13px; color: #02222b; background: #67efff; border: 1px solid #8ff6ff; border-radius: 13px; padding: 4px 11px; font-weight: 850; }
@@ -584,8 +602,8 @@ class DashboardWindow(QtWidgets.QMainWindow):
             #BadgeNeutral { font-size: 13px; color: #d8e7ff; background: #23364f; border: 1px solid #3d5c81; border-radius: 13px; padding: 4px 11px; font-weight: 800; }
             #BadgeWarn { font-size: 13px; color: #3d2a00; background: #ffd67f; border: 1px solid #ffe09e; border-radius: 13px; padding: 4px 11px; font-weight: 850; }
             #BadgeBad { font-size: 13px; color: #390000; background: #ff9c9c; border: 1px solid #ffb8b8; border-radius: 13px; padding: 4px 11px; font-weight: 850; }
-            #Warn { font-size: 12px; color: #ffc374; font-weight: 600; }
-            #Help { font-size: 10px; color: #7690b2; }
+            #Warn { font-size: 11px; color: #ffc374; font-weight: 520; }
+            #Help { font-size: 9px; color: #6b84a6; }
             """
         )
         pg.setConfigOptions(antialias=True, background="#0b0f14", foreground="#d9e2f2")
@@ -599,12 +617,12 @@ class DashboardWindow(QtWidgets.QMainWindow):
         self.refresh(force=True)
 
     def _style_plot(self, plot: pg.PlotItem, title: str):
-        plot.setTitle(f"<span style='color:#cfe2ff;font-size:13pt;font-weight:700'>{title}</span>")
+        plot.setTitle(f"<span style='color:#cfe2ff;font-size:12pt;font-weight:680'>{title}</span>")
         plot.setLabel("left", "USD")
         plot.showGrid(x=True, y=True, alpha=0.05)
         for ax in (plot.getAxis("left"), plot.getAxis("bottom")):
             ax.setTextPen(pg.mkPen("#b9d0ee")); ax.setPen(pg.mkPen("#35506f"))
-        plot.addLegend(offset=(8, 8))
+        plot.addLegend(offset=(5, 5), labelTextSize="8pt")
 
     def _init_plot_state(self, plot: pg.PlotItem, color: str, endpoint: str) -> Dict[str, object]:
         line = plot.plot([], [], pen=pg.mkPen(color, width=4.2), name="Serie real")
@@ -643,6 +661,7 @@ class DashboardWindow(QtWidgets.QMainWindow):
     def _update_plot_state(self, state: Dict[str, object], s: pd.DataFrame):
         plot = state["plot"]
         line = state["line"]; last = state["last"]; vmax = state["max"]; vmin = state["min"]; txt = state["text"]
+        s = _sanitize_series_for_plot(s)
         if s.empty:
             line.setData([], [])
             last.setData([], [])
@@ -668,17 +687,19 @@ class DashboardWindow(QtWidgets.QMainWindow):
         imax = int(np.argmax(y)); imin = int(np.argmin(y))
         vmax.setData([x[imax]], [y[imax]])
         vmin.setData([x[imin]], [y[imin]])
-        ymin = float(np.min(y))
-        ymax = float(np.max(y))
-        span = ymax - ymin
+        y_recent = y[-min(len(y), 60):]
+        q_low = float(np.nanpercentile(y_recent, 10))
+        q_high = float(np.nanpercentile(y_recent, 90))
+        y_min = float(np.min(y_recent))
+        y_max = float(np.max(y_recent))
+        lower = min(y_min, q_low)
+        upper = max(y_max, q_high)
+        span = upper - lower
         if span <= 0.0:
-            pad = max(0.05, abs(ymax) * 0.005)
-            plot.setYRange(round(ymin - pad, 2), round(ymax + pad, 2), padding=0.0)
-        elif span < max(0.1, abs(ymax) * 0.002):
-            pad = max(0.05, span * 2.0)
-            plot.setYRange(round(ymin - pad, 2), round(ymax + pad, 2), padding=0.0)
+            pad = max(0.05, abs(upper) * 0.005)
         else:
-            plot.enableAutoRange(axis=plot.getViewBox().YAxis)
+            pad = max(0.05, span * 0.28)
+        plot.setYRange(round(lower - pad, 2), round(upper + pad, 2), padding=0.0)
 
     def refresh(self, force: bool = False):
         if self.paused and not force:
@@ -717,10 +738,12 @@ class DashboardWindow(QtWidgets.QMainWindow):
             self._update_plot_state(self.plot_states["day"], snap.series_days)
 
             if snap.warnings:
-                compact = [w.strip()[:180] + ("…" if len(w.strip()) > 180 else "") for w in snap.warnings[:6]]
-                self.lbl_warn.setText("⚠ " + " | ".join(compact))
+                compact = [w.strip()[:110] + ("…" if len(w.strip()) > 110 else "") for w in snap.warnings[:3]]
+                self.lbl_warn.setText("⚠ " + " · ".join(compact))
+                self.lbl_warn.setToolTip("\n".join(snap.warnings))
             else:
                 self.lbl_warn.setText("")
+                self.lbl_warn.setToolTip("")
         except Exception as e:
             self.lbl_warn.setText(f"⚠ Error monitor: {e}")
             traceback.print_exc()
