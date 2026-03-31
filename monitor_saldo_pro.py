@@ -581,7 +581,7 @@ class DashboardWindow(QtWidgets.QMainWindow):
         hl = QtWidgets.QVBoxLayout(header); hl.setContentsMargins(16, 14, 16, 14); hl.setSpacing(12)
 
         top = QtWidgets.QHBoxLayout(); top.setSpacing(10)
-        self.lbl_title = QtWidgets.QLabel("SALDO REAL DERIV ACTUAL"); self.lbl_title.setObjectName("Title")
+        self.lbl_title = QtWidgets.QLabel(f"SALDO REAL DERIV ACTUAL · {MONITOR_VERSION}"); self.lbl_title.setObjectName("Title")
         self.lbl_source = QtWidgets.QLabel("FUENTE: --"); self.lbl_source.setObjectName("BadgeWarn")
         top.addWidget(self.lbl_title, 1); top.addWidget(self.lbl_source, 0)
         hl.addLayout(top)
@@ -822,7 +822,6 @@ class DashboardWindow(QtWidgets.QMainWindow):
 
             main_scale = self._update_plot_state(self.plot_states["main"], snap.series_main)
             self._update_plot_state(self.plot_states["min"], snap.series_minutes)
-            self._update_plot_state(self.plot_states["hour"], snap.series_hours)
             self._update_plot_state(self.plot_states["day"], snap.series_days)
             self.lbl_scale.setText(f"ESCALA Y: {main_scale}")
 
