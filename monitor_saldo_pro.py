@@ -24,11 +24,13 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
+from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
 import pyqtgraph as pg
 from PySide6 import QtCore, QtGui, QtWidgets
+from saldo_csv_tools import refresh_aggregate_csvs
 
 # ------------------------ Config ------------------------
 CUENTA_OBJETIVO = "REAL"  # REAL | DEMO | ALL
@@ -42,6 +44,10 @@ LOG_SALDOS = "LOG_SALDOS"
 CSV_PATTERN = "registro_enriquecido_fulll*.csv"
 SALDO_LIVE_FILE = "saldo_real_live.json"
 SALDO_LIVE_HISTORY_FILE = "saldo_real_live_history.jsonl"
+SALDO_SERIES_CSV_FILE = "saldo_real_series.csv"
+SALDO_1MIN_CSV_FILE = "saldo_real_1min.csv"
+SALDO_1H_CSV_FILE = "saldo_real_1h.csv"
+DISPLAY_TIMEZONE = "America/Lima"
 SALDO_LIVE_SHARED_PATH = os.path.abspath(
     os.getenv("SALDO_LIVE_SHARED_PATH", os.path.join(os.path.expanduser("~"), SALDO_LIVE_FILE))
 )
@@ -64,11 +70,12 @@ Y_AXIS_MAX_USD = float(os.getenv("Y_AXIS_MAX_USD", "300"))
 Y_AUTO_SPAN_USD = float(os.getenv("Y_AUTO_SPAN_USD", "120"))
 CAPITAL_BASE_USD = float(os.getenv("CAPITAL_BASE_USD", "0") or "0")
 MIN_X_SPAN_SECONDS = 20.0
+DISPLAY_TZ = ZoneInfo(DISPLAY_TIMEZONE)
 
 
 
 def _now() -> datetime:
-    return datetime.now().astimezone()
+    return datetime.now(timezone.utc).astimezone(DISPLAY_TZ)
 
 
 def _fmt_money(v: Optional[float]) -> str:
@@ -84,11 +91,11 @@ def _fmt_local_ts(ts_obj) -> str:
         if isinstance(ts_obj, pd.Timestamp):
             if ts_obj.tzinfo is None:
                 ts_obj = ts_obj.tz_localize("UTC")
-            return ts_obj.to_pydatetime().astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
+            return ts_obj.to_pydatetime().astimezone(DISPLAY_TZ).strftime("%Y-%m-%d %H:%M:%S %Z")
         if isinstance(ts_obj, datetime):
             if ts_obj.tzinfo is None:
                 ts_obj = ts_obj.replace(tzinfo=timezone.utc)
-            return ts_obj.astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
+            return ts_obj.astimezone(DISPLAY_TZ).strftime("%Y-%m-%d %H:%M:%S %Z")
     except Exception:
         return "--"
     return "--"
@@ -166,7 +173,7 @@ class SmartDateAxis(pg.DateAxisItem):
                     out.append("")
                     continue
                 dt_utc = datetime.fromtimestamp(float(v), tz=timezone.utc)
-                dt_local = dt_utc.astimezone()
+                dt_local = dt_utc.astimezone(DISPLAY_TZ)
                 if span <= 15 * 60:
                     label = dt_local.strftime("%H:%M:%S")
                 elif span <= 6 * 3600:
@@ -211,6 +218,7 @@ class DataEngine:
         self.base_dir = base_dir
         self._cache: Dict[str, Tuple[Tuple, object]] = {}
         self._history_last_seen: Optional[Tuple[str, int, int]] = None
+        self._agg_cache_state: Dict[str, object] = {}
 
     @staticmethod
     def _sig(paths: List[Path]) -> Tuple:
@@ -251,6 +259,34 @@ class DataEngine:
                 seen.add(k)
                 out.append(p)
         return out
+
+    def _saldo_series_paths(self) -> Tuple[Path, Path, Path]:
+        base = Path(SALDO_LIVE_SHARED_PATH).expanduser().parent
+        raw = Path(os.getenv("SALDO_SERIES_CSV_PATH", str(base / SALDO_SERIES_CSV_FILE))).expanduser()
+        p1 = Path(os.getenv("SALDO_1MIN_CSV_PATH", str(raw.parent / SALDO_1MIN_CSV_FILE))).expanduser()
+        p2 = Path(os.getenv("SALDO_1H_CSV_PATH", str(raw.parent / SALDO_1H_CSV_FILE))).expanduser()
+        return raw, p1, p2
+
+    def _validate_balance_csvs(self, warnings: List[str]) -> None:
+        raw_csv, min_csv, hour_csv = self._saldo_series_paths()
+        ok, msg, self._agg_cache_state = refresh_aggregate_csvs(
+            str(raw_csv), str(min_csv), str(hour_csv), self._agg_cache_state
+        )
+        if not ok and msg != "raw_missing":
+            warnings.append(f"CSV agregado no regenerado/validado: {msg}")
+        if raw_csv.exists():
+            if not min_csv.exists() or not hour_csv.exists():
+                warnings.append("CSV agregado faltante: revisar saldo_real_1min.csv / saldo_real_1h.csv")
+            hist_paths = self._master_history_candidates()
+            hist_path = next((p for p in hist_paths if p.exists()), None)
+            if hist_path and hist_path.exists():
+                try:
+                    raw_mtime = raw_csv.stat().st_mtime
+                    hist_mtime = hist_path.stat().st_mtime
+                    if raw_mtime + 2 < hist_mtime:
+                        warnings.append("CSV crudo desfasado respecto al histórico JSONL")
+                except Exception:
+                    pass
 
     def _cached(self, key: str, sig: Tuple):
         old = self._cache.get(key)
@@ -469,6 +505,7 @@ class DataEngine:
             warnings.append(hist_msg)
 
         if view == "REAL":
+            self._validate_balance_csvs(warnings)
             warnings.append(f"Monitor {MONITOR_VERSION} · id={MONITOR_BUILD_ID}")
             if not hasattr(self, "_check_history_growth"):
                 warnings.append("Versión desactualizada detectada: faltan validaciones de crecimiento de histórico")
@@ -594,10 +631,16 @@ class DashboardWindow(QtWidgets.QMainWindow):
         meta = QtWidgets.QHBoxLayout(); meta.setSpacing(10)
         self.lbl_refresh = QtWidgets.QLabel("REFRESCO: ACTIVO"); self.lbl_refresh.setObjectName("MetaBox")
         self.lbl_scale = QtWidgets.QLabel("ESCALA Y: --"); self.lbl_scale.setObjectName("MetaBox")
+        self.lbl_delta = QtWidgets.QLabel("Δ VIS: --"); self.lbl_delta.setObjectName("MetaBox")
+        self.lbl_samples = QtWidgets.QLabel("MUESTRAS: --"); self.lbl_samples.setObjectName("MetaBox")
+        self.lbl_tz = QtWidgets.QLabel(f"TZ: {DISPLAY_TIMEZONE}"); self.lbl_tz.setObjectName("MetaBox")
         self.lbl_now = QtWidgets.QLabel("HORA LOCAL: --"); self.lbl_now.setObjectName("MetaNow")
         self.lbl_last = QtWidgets.QLabel("ÚLTIMA ACT: --"); self.lbl_last.setObjectName("MetaLast")
         meta.addWidget(self.lbl_refresh)
         meta.addWidget(self.lbl_scale)
+        meta.addWidget(self.lbl_delta)
+        meta.addWidget(self.lbl_samples)
+        meta.addWidget(self.lbl_tz)
         meta.addWidget(self.lbl_now, 1)
         meta.addWidget(self.lbl_last)
         hl.addLayout(meta)
@@ -799,7 +842,7 @@ class DashboardWindow(QtWidgets.QMainWindow):
             snap = self.engine.build_snapshot(self.view)
             self.lbl_big.setText(_fmt_money(snap.saldo_actual))
             refresh_state = "PAUSADO" if self.paused else "ACTIVO"
-            last = snap.last_update.astimezone().strftime("%Y-%m-%d %H:%M:%S %Z") if snap.last_update else "--"
+            last = snap.last_update.astimezone(DISPLAY_TZ).strftime("%Y-%m-%d %H:%M:%S %Z") if snap.last_update else "--"
             self.lbl_refresh.setText(f"REFRESCO: {refresh_state}")
             self.lbl_now.setText(f"HORA LOCAL: {snap.now.strftime('%H:%M:%S %Z')}")
             self.lbl_last.setText(f"ÚLTIMA ACT: {last}")
@@ -822,8 +865,20 @@ class DashboardWindow(QtWidgets.QMainWindow):
 
             main_scale = self._update_plot_state(self.plot_states["main"], snap.series_main)
             self._update_plot_state(self.plot_states["min"], snap.series_minutes)
+            self._update_plot_state(self.plot_states["hour"], snap.series_hours)
             self._update_plot_state(self.plot_states["day"], snap.series_days)
             self.lbl_scale.setText(f"ESCALA Y: {main_scale}")
+            visible = _sanitize_series_for_plot(snap.series_main)
+            n_visible = int(len(visible))
+            if n_visible >= 1:
+                first = float(visible["equity"].iloc[0])
+                last_v = float(visible["equity"].iloc[-1])
+                delta = last_v - first
+                pct = (delta / first * 100.0) if abs(first) > 1e-12 else 0.0
+                self.lbl_delta.setText(f"Δ VIS: {delta:+,.2f} USD ({pct:+.2f}%)")
+            else:
+                self.lbl_delta.setText("Δ VIS: --")
+            self.lbl_samples.setText(f"MUESTRAS: {n_visible}")
 
             if snap.warnings:
                 compact = [w.strip()[:110] + ("…" if len(w.strip()) > 110 else "") for w in snap.warnings[:3]]
