@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import glob
 import json
+import os
 import re
 import sys
 import traceback
@@ -45,10 +46,11 @@ FULLSCREEN_INICIAL = False
 LOG_SALDOS = "LOG_SALDOS"
 CSV_PATTERN = "registro_enriquecido_fulll*.csv"
 SALDO_LIVE_FILE = "saldo_real_live.json"
+SALDO_LIVE_PATH = os.getenv("SALDO_LIVE_PATH", "").strip()
 
 
 def _now() -> datetime:
-    return datetime.now(timezone.utc)
+    return datetime.now().astimezone()
 
 
 def _fmt_money(v: Optional[float]) -> str:
@@ -104,21 +106,47 @@ class DataEngine:
     def __init__(self, base_dir: Path):
         self.base_dir = base_dir
 
-    def _read_master_live(self) -> Optional[Tuple[float, datetime]]:
-        p = self.base_dir / SALDO_LIVE_FILE
-        if not p.exists():
-            return None
-        try:
-            obj = json.loads(p.read_text(encoding="utf-8", errors="ignore"))
-            v = _safe_float(obj.get("saldo_real"), default=np.nan)
-            if not np.isfinite(v):
-                return None
-            ts = pd.to_datetime(obj.get("timestamp"), errors="coerce", utc=True)
-            if pd.isna(ts):
-                ts = pd.to_datetime(p.stat().st_mtime, unit="s", utc=True)
-            return float(v), ts.to_pydatetime()
-        except Exception:
-            return None
+    def _master_live_candidates(self) -> List[Path]:
+        candidates: List[Path] = []
+        if SALDO_LIVE_PATH:
+            custom = Path(SALDO_LIVE_PATH).expanduser()
+            candidates.append(custom / SALDO_LIVE_FILE if custom.is_dir() else custom)
+        candidates.append(self.base_dir / SALDO_LIVE_FILE)
+        candidates.append(Path.cwd() / SALDO_LIVE_FILE)
+
+        unique: List[Path] = []
+        seen = set()
+        for p in candidates:
+            k = str(p.resolve()) if p.exists() else str(p)
+            if k in seen:
+                continue
+            seen.add(k)
+            unique.append(p)
+        return unique
+
+    def _read_master_live(self) -> Tuple[Optional[Tuple[float, datetime]], Optional[str]]:
+        candidates = self._master_live_candidates()
+        found_any = False
+        for p in candidates:
+            if not p.exists():
+                continue
+            found_any = True
+            try:
+                obj = json.loads(p.read_text(encoding="utf-8", errors="ignore"))
+                v = _safe_float(obj.get("saldo_real"), default=np.nan)
+                if not np.isfinite(v):
+                    return None, f"{SALDO_LIVE_FILE} inválido en {p}"
+                ts = pd.to_datetime(obj.get("timestamp"), errors="coerce", utc=True)
+                if pd.isna(ts):
+                    ts = pd.to_datetime(p.stat().st_mtime, unit="s", utc=True)
+                return (float(v), ts.to_pydatetime()), None
+            except Exception:
+                return None, f"{SALDO_LIVE_FILE} inválido en {p}"
+
+        configured = SALDO_LIVE_PATH if SALDO_LIVE_PATH else "(no configurada; usando ruta local/cwd)"
+        if not found_any:
+            return None, f"{SALDO_LIVE_FILE} no encontrado en ruta configurada: {configured}"
+        return None, f"saldo real del maestro no disponible ({SALDO_LIVE_FILE})"
 
     def _parse_observed(self, view: str) -> pd.DataFrame:
         patterns: List[re.Pattern]
@@ -226,9 +254,11 @@ class DataEngine:
         now = _now()
         warnings: List[str] = []
 
-        master = self._read_master_live() if view == "REAL" else None
+        master, master_msg = self._read_master_live() if view == "REAL" else (None, None)
         observed = self._parse_observed(view)
         estimated = self._build_estimated(view)
+        if master_msg and view == "REAL":
+            warnings.append(master_msg)
 
         source = "SIN DATOS REALES"
         saldo_actual: Optional[float] = None
@@ -263,7 +293,7 @@ class DataEngine:
                 source = "SIN DATOS REALES"
                 saldo_actual = None
                 last_update = None
-                warnings.append("SALDO REAL NO DISPONIBLE. Se oculta saldo principal estimado.")
+                warnings.append("saldo real del maestro no disponible")
 
         if source == "SIN DATOS REALES" and not estimated.empty:
             warnings.append("Estimado CSV disponible solo como auxiliar (no saldo principal).")
@@ -449,9 +479,9 @@ class DashboardWindow(QtWidgets.QMainWindow):
             snap = self.engine.build_snapshot(self.view)
             self.lbl_big.setText(_fmt_money(snap.saldo_actual))
             refresh_state = "PAUSADO" if self.paused else "ACTIVO"
-            last = snap.last_update.strftime("%Y-%m-%d %H:%M:%S UTC") if snap.last_update else "--"
+            last = snap.last_update.astimezone().strftime("%Y-%m-%d %H:%M:%S %Z") if snap.last_update else "--"
             self.lbl_refresh.setText(f"REFRESCO: {refresh_state}")
-            self.lbl_now.setText(f"HORA ACTUAL: {snap.now.strftime('%H:%M:%S UTC')}")
+            self.lbl_now.setText(f"HORA LOCAL: {snap.now.strftime('%H:%M:%S %Z')}")
             self.lbl_last.setText(f"ÚLTIMA ACT: {last}")
 
             src = snap.source.upper().strip()
