@@ -58,10 +58,11 @@ MONITOR_BUILD_ID = "MONITOR_SALDO_PRO_REAL_SERIES_GUARD"
 MIN_POINTS_FOR_LINE = 2
 SHOW_LAST_MARKER = True
 SHOW_EXTREME_MARKERS = False
-Y_SCALE_MODE = os.getenv("Y_SCALE_MODE", "manual").strip().lower()  # manual | auto
+Y_SCALE_MODE = os.getenv("Y_SCALE_MODE", "capital").strip().lower()  # capital | manual | auto
 Y_AXIS_MIN_USD = float(os.getenv("Y_AXIS_MIN_USD", "0"))
 Y_AXIS_MAX_USD = float(os.getenv("Y_AXIS_MAX_USD", "300"))
 Y_AUTO_SPAN_USD = float(os.getenv("Y_AUTO_SPAN_USD", "120"))
+CAPITAL_BASE_USD = float(os.getenv("CAPITAL_BASE_USD", "0") or "0")
 
 
 
@@ -601,10 +602,12 @@ class DashboardWindow(QtWidgets.QMainWindow):
         self.graphics = pg.GraphicsLayoutWidget(); root.addWidget(self.graphics, 1)
         self.p_main = self.graphics.addPlot(row=0, col=0, colspan=2, axisItems={"bottom": SmartDateAxis("bottom"), "left": MoneyAxis("left")})
         self.p_min = self.graphics.addPlot(row=1, col=0, axisItems={"bottom": SmartDateAxis("bottom"), "left": MoneyAxis("left")})
-        self.p_day = self.graphics.addPlot(row=1, col=1, axisItems={"bottom": SmartDateAxis("bottom"), "left": MoneyAxis("left")})
+        self.p_hour = self.graphics.addPlot(row=1, col=1, axisItems={"bottom": SmartDateAxis("bottom"), "left": MoneyAxis("left")})
+        self.p_day = self.graphics.addPlot(row=2, col=0, colspan=2, axisItems={"bottom": SmartDateAxis("bottom"), "left": MoneyAxis("left")})
 
         self._style_plot(self.p_main, "EQUITY CURVE PRINCIPAL · dinero vs tiempo")
         self._style_plot(self.p_min, "MINUTOS · detalle")
+        self._style_plot(self.p_hour, "HORAS · comportamiento")
         self._style_plot(self.p_day, "DÍAS · tendencia")
 
         self.plot_states = {
@@ -660,6 +663,17 @@ class DashboardWindow(QtWidgets.QMainWindow):
     def _resolve_y_range(self, y: Optional[np.ndarray]) -> Tuple[float, float]:
         if Y_SCALE_MODE == "manual":
             return float(Y_AXIS_MIN_USD), float(Y_AXIS_MAX_USD)
+        if Y_SCALE_MODE == "capital":
+            if CAPITAL_BASE_USD > 0:
+                base = float(CAPITAL_BASE_USD)
+            elif y is not None and len(y) > 0:
+                base = float(max(1.0, np.nanmedian(y)))
+            else:
+                base = 100.0
+            band = max(8.0, base * 0.60)
+            y0 = max(0.0, base - band * 0.35)
+            y1 = y0 + band
+            return y0, y1
         if y is None or len(y) == 0:
             return 0.0, float(max(10.0, Y_AUTO_SPAN_USD))
         center = float(np.nanmedian(y))
@@ -691,7 +705,7 @@ class DashboardWindow(QtWidgets.QMainWindow):
         elif k == QtCore.Qt.Key_P:
             self.paused = not self.paused; self.refresh(force=True)
         elif k == QtCore.Qt.Key_R:
-            self.p_main.enableAutoRange(); self.p_min.enableAutoRange(); self.p_day.enableAutoRange()
+            self.p_main.enableAutoRange(); self.p_min.enableAutoRange(); self.p_hour.enableAutoRange(); self.p_day.enableAutoRange()
         elif k == QtCore.Qt.Key_Q:
             self.close()
         else:
