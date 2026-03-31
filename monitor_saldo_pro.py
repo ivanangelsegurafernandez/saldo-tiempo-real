@@ -53,6 +53,11 @@ SALDO_LIVE_HISTORY_SHARED_PATH = os.path.abspath(
 )
 SALDO_LIVE_PATH = os.getenv("SALDO_LIVE_PATH", "").strip()
 
+MONITOR_VERSION = "v2026.03.31-r1"
+MONITOR_BUILD_ID = "MONITOR_SALDO_PRO_REAL_SERIES_GUARD"
+MIN_POINTS_FOR_LINE = 2
+
+
 
 def _now() -> datetime:
     return datetime.now().astimezone()
@@ -62,6 +67,23 @@ def _fmt_money(v: Optional[float]) -> str:
     if v is None or (isinstance(v, float) and not np.isfinite(v)):
         return "--"
     return f"{v:,.2f} USD"
+
+
+def _fmt_local_ts(ts_obj) -> str:
+    if ts_obj is None:
+        return "--"
+    try:
+        if isinstance(ts_obj, pd.Timestamp):
+            if ts_obj.tzinfo is None:
+                ts_obj = ts_obj.tz_localize("UTC")
+            return ts_obj.to_pydatetime().astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
+        if isinstance(ts_obj, datetime):
+            if ts_obj.tzinfo is None:
+                ts_obj = ts_obj.replace(tzinfo=timezone.utc)
+            return ts_obj.astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
+    except Exception:
+        return "--"
+    return "--"
 
 
 def _safe_float(x, default=np.nan):
@@ -132,6 +154,7 @@ class DataEngine:
     def __init__(self, base_dir: Path):
         self.base_dir = base_dir
         self._cache: Dict[str, Tuple[Tuple, object]] = {}
+        self._history_last_seen: Optional[Tuple[str, int, int]] = None
 
     @staticmethod
     def _sig(paths: List[Path]) -> Tuple:
@@ -183,7 +206,7 @@ class DataEngine:
         self._cache[key] = (sig, value)
         return value
 
-    def _read_master_live(self) -> Tuple[Optional[Tuple[float, datetime]], Optional[str]]:
+    def _read_master_live(self) -> Tuple[Optional[Tuple[float, datetime]], Optional[str], Optional[Path]]:
         paths = self._master_live_candidates()
         sig = self._sig(paths)
         cached = self._cached("live", sig)
@@ -200,21 +223,21 @@ class DataEngine:
                 v = _safe_float(obj.get("saldo_real"), default=np.nan)
                 if not np.isfinite(v):
                     msg = f"{SALDO_LIVE_FILE} inválido en {'ruta compartida' if str(p)==SALDO_LIVE_SHARED_PATH else p}"
-                    return self._store_cache("live", sig, (None, msg))
+                    return self._store_cache("live", sig, (None, msg, p))
                 ts = pd.to_datetime(obj.get("timestamp"), errors="coerce", utc=True)
                 if pd.isna(ts):
                     ts = pd.to_datetime(p.stat().st_mtime, unit="s", utc=True)
-                return self._store_cache("live", sig, ((float(v), ts.to_pydatetime()), None))
+                return self._store_cache("live", sig, ((float(v), ts.to_pydatetime()), None, p))
             except Exception:
                 msg = f"{SALDO_LIVE_FILE} inválido en {'ruta compartida' if str(p)==SALDO_LIVE_SHARED_PATH else p}"
-                return self._store_cache("live", sig, (None, msg))
+                return self._store_cache("live", sig, (None, msg, p))
 
         msg = f"{SALDO_LIVE_FILE} no encontrado en ruta compartida: {SALDO_LIVE_SHARED_PATH}"
         if found_any:
             msg = f"saldo real del maestro no disponible ({SALDO_LIVE_FILE})"
-        return self._store_cache("live", sig, (None, msg))
+        return self._store_cache("live", sig, (None, msg, None))
 
-    def _read_master_history(self) -> Tuple[pd.DataFrame, Optional[str]]:
+    def _read_master_history(self) -> Tuple[pd.DataFrame, Optional[str], Optional[Path], Optional[str]]:
         paths = self._master_history_candidates()
         sig = self._sig(paths)
         cached = self._cached("hist", sig)
@@ -242,16 +265,34 @@ class DataEngine:
                 if rows:
                     d = pd.DataFrame(rows, columns=["timestamp", "equity"]).sort_values("timestamp")
                     d = d.drop_duplicates(subset=["timestamp", "equity"], keep="last")
-                    return self._store_cache("hist", sig, (d, None))
+                    growth_msg = self._check_history_growth(p, len(d))
+                    return self._store_cache("hist", sig, (d, None, p, growth_msg))
             except Exception:
                 msg = f"{SALDO_LIVE_HISTORY_FILE} inválido en {'ruta compartida' if str(p)==SALDO_LIVE_HISTORY_SHARED_PATH else p}"
-                return self._store_cache("hist", sig, (pd.DataFrame(columns=["timestamp", "equity"]), msg))
+                return self._store_cache("hist", sig, (pd.DataFrame(columns=["timestamp", "equity"]), msg, p, None))
 
         return self._store_cache(
             "hist",
             sig,
-            (pd.DataFrame(columns=["timestamp", "equity"]), f"{SALDO_LIVE_HISTORY_FILE} no encontrado en ruta compartida: {SALDO_LIVE_HISTORY_SHARED_PATH}"),
+            (pd.DataFrame(columns=["timestamp", "equity"]), f"Sin histórico real: no se encontró {SALDO_LIVE_HISTORY_FILE} en ruta compartida: {SALDO_LIVE_HISTORY_SHARED_PATH}", None, None),
         )
+
+    def _check_history_growth(self, path: Path, valid_rows: int) -> Optional[str]:
+        try:
+            st = path.stat()
+            current = (str(path), st.st_size, valid_rows)
+            previous = self._history_last_seen
+            self._history_last_seen = current
+            if previous is None or previous[0] != current[0]:
+                return None
+            if previous[1] == current[1] and previous[2] == current[2]:
+                return (
+                    f"Histórico sin crecimiento: {SALDO_LIVE_HISTORY_FILE} no cambió "
+                    f"(size={current[1]} bytes, muestras={current[2]})"
+                )
+        except Exception:
+            return None
+        return None
 
     def _parse_observed(self, view: str) -> pd.DataFrame:
         if view == "ALL":
@@ -361,8 +402,8 @@ class DataEngine:
         now = _now()
         warnings: List[str] = []
 
-        master, master_msg = self._read_master_live() if view == "REAL" else (None, None)
-        hist, hist_msg = self._read_master_history() if view == "REAL" else (pd.DataFrame(columns=["timestamp", "equity"]), None)
+        master, master_msg, live_path_used = self._read_master_live() if view == "REAL" else (None, None, None)
+        hist, hist_msg, hist_path_used, hist_growth_msg = self._read_master_history() if view == "REAL" else (pd.DataFrame(columns=["timestamp", "equity"]), None, None, None)
         observed = self._parse_observed(view)
         estimated = self._build_estimated(view)
 
@@ -370,6 +411,24 @@ class DataEngine:
             warnings.append(master_msg)
         if hist_msg and view == "REAL":
             warnings.append(hist_msg)
+
+        if view == "REAL":
+            warnings.append(f"Monitor {MONITOR_VERSION} · id={MONITOR_BUILD_ID}")
+            if not hasattr(self, "_check_history_growth"):
+                warnings.append("Versión desactualizada detectada: faltan validaciones de crecimiento de histórico")
+            warnings.append(f"Ruta snapshot real: {live_path_used if live_path_used else SALDO_LIVE_SHARED_PATH}")
+            warnings.append(f"Ruta histórico real: {hist_path_used if hist_path_used else SALDO_LIVE_HISTORY_SHARED_PATH}")
+            warnings.append(
+                f"Estado snapshot: {'OK' if live_path_used and Path(live_path_used).exists() else 'NO ENCONTRADO'} | "
+                f"Estado histórico: {'OK' if hist_path_used and Path(hist_path_used).exists() else 'NO ENCONTRADO'}"
+            )
+            valid_rows = int(len(hist))
+            last_hist_ts = _fmt_local_ts(hist["timestamp"].iloc[-1]) if valid_rows else "--"
+            warnings.append(
+                f"Histórico válido: {valid_rows} muestra(s) | última marca válida: {last_hist_ts}"
+            )
+            if hist_growth_msg:
+                warnings.append(hist_growth_msg)
 
         source = "SIN DATOS REALES"
         saldo_actual: Optional[float] = None
@@ -409,8 +468,13 @@ class DataEngine:
             else:
                 warnings.append("saldo real del maestro no disponible")
 
-        if len(real_series) < 2:
-            warnings.append("Historial real aún en construcción")
+        real_points = int(len(real_series))
+        if real_points == 0:
+            warnings.append("Sin datos para graficar: 0 muestras reales válidas")
+            warnings.append(f"Sin histórico real: no se encontró {SALDO_LIVE_HISTORY_FILE}")
+        elif real_points == 1:
+            warnings.append("Histórico insuficiente: solo 1 muestra real válida")
+            warnings.append("No se puede trazar línea: se requieren al menos 2 puntos")
         if source == "SIN DATOS REALES" and not estimated.empty:
             warnings.append("Estimado CSV disponible solo como auxiliar")
 
@@ -445,7 +509,7 @@ class DashboardWindow(QtWidgets.QMainWindow):
         self.engine = engine
         self.view = CUENTA_OBJETIVO if CUENTA_OBJETIVO in ("REAL", "DEMO", "ALL") else "REAL"
         self.paused = False
-        self.setWindowTitle("Monitor Saldo Real Deriv")
+        self.setWindowTitle(f"Monitor Saldo Real Deriv {MONITOR_VERSION}")
         self.resize(1600, 900)
 
         cw = QtWidgets.QWidget()
@@ -458,7 +522,7 @@ class DashboardWindow(QtWidgets.QMainWindow):
         hl = QtWidgets.QVBoxLayout(header); hl.setContentsMargins(16, 14, 16, 14); hl.setSpacing(12)
 
         top = QtWidgets.QHBoxLayout(); top.setSpacing(10)
-        self.lbl_title = QtWidgets.QLabel("SALDO REAL DERIV ACTUAL"); self.lbl_title.setObjectName("Title")
+        self.lbl_title = QtWidgets.QLabel(f"SALDO REAL DERIV ACTUAL · {MONITOR_VERSION}"); self.lbl_title.setObjectName("Title")
         self.lbl_source = QtWidgets.QLabel("FUENTE: --"); self.lbl_source.setObjectName("BadgeWarn")
         top.addWidget(self.lbl_title, 1); top.addWidget(self.lbl_source, 0)
         hl.addLayout(top)
@@ -471,7 +535,8 @@ class DashboardWindow(QtWidgets.QMainWindow):
         self.lbl_refresh = QtWidgets.QLabel("REFRESCO: ACTIVO"); self.lbl_refresh.setObjectName("MetaBox")
         self.lbl_now = QtWidgets.QLabel("HORA LOCAL: --"); self.lbl_now.setObjectName("MetaNow")
         self.lbl_last = QtWidgets.QLabel("ÚLTIMA ACT: --"); self.lbl_last.setObjectName("MetaLast")
-        meta.addWidget(self.lbl_refresh); meta.addWidget(self.lbl_now, 1); meta.addWidget(self.lbl_last)
+        self.lbl_build = QtWidgets.QLabel(f"BUILD: {MONITOR_BUILD_ID}"); self.lbl_build.setObjectName("MetaBox")
+        meta.addWidget(self.lbl_refresh); meta.addWidget(self.lbl_now, 1); meta.addWidget(self.lbl_last); meta.addWidget(self.lbl_build)
         hl.addLayout(meta)
         root.addWidget(header)
 
@@ -573,22 +638,23 @@ class DashboardWindow(QtWidgets.QMainWindow):
             last.setData([], [])
             vmax.setData([], [])
             vmin.setData([], [])
-            txt.setText("Sin datos")
+            txt.setText("Sin histórico real: 0 muestras válidas")
             txt.setPos(0, 0)
             return
 
         x = (s["timestamp"].astype("int64") / 1e9).to_numpy(dtype=float)
         y = s["equity"].to_numpy(dtype=float)
 
-        if len(x) >= 2:
+        if len(x) >= MIN_POINTS_FOR_LINE:
             line.setData(x, y)
             txt.setText("")
         else:
             line.setData([], [])
-            txt.setText("Historial real aún en construcción")
+            txt.setText("No se puede trazar línea: se requieren al menos 2 puntos")
             txt.setPos(float(x[-1]), float(y[-1]))
 
-        last.setData([x[-1]], [y[-1]])
+        marker_size = 18 if len(x) == 1 else 13
+        last.setData([x[-1]], [y[-1]], symbolSize=marker_size)
         imax = int(np.argmax(y)); imin = int(np.argmin(y))
         vmax.setData([x[imax]], [y[imax]])
         vmin.setData([x[imin]], [y[imin]])
@@ -610,6 +676,8 @@ class DashboardWindow(QtWidgets.QMainWindow):
         if self.isMinimized() and not force:
             return
         try:
+            if not MONITOR_BUILD_ID or MIN_POINTS_FOR_LINE != 2:
+                self.lbl_warn.setText("⚠ Versión desactualizada o incompleta del monitor detectada")
             snap = self.engine.build_snapshot(self.view)
             self.lbl_big.setText(_fmt_money(snap.saldo_actual))
             refresh_state = "PAUSADO" if self.paused else "ACTIVO"
@@ -639,7 +707,7 @@ class DashboardWindow(QtWidgets.QMainWindow):
             self._update_plot_state(self.plot_states["day"], snap.series_days)
 
             if snap.warnings:
-                compact = [w.strip()[:120] + ("…" if len(w.strip()) > 120 else "") for w in snap.warnings[:2]]
+                compact = [w.strip()[:180] + ("…" if len(w.strip()) > 180 else "") for w in snap.warnings[:6]]
                 self.lbl_warn.setText("⚠ " + " | ".join(compact))
             else:
                 self.lbl_warn.setText("")
@@ -649,6 +717,7 @@ class DashboardWindow(QtWidgets.QMainWindow):
 
 
 def main():
+    print(f"[MONITOR] Monitor Saldo Real Deriv {MONITOR_VERSION} · build={MONITOR_BUILD_ID}")
     app = QtWidgets.QApplication(sys.argv)
     w = DashboardWindow(DataEngine(Path(__file__).resolve().parent))
     w.show()
