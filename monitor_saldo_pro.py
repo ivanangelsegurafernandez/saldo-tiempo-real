@@ -56,6 +56,8 @@ SALDO_LIVE_PATH = os.getenv("SALDO_LIVE_PATH", "").strip()
 MONITOR_VERSION = "v2026.03.31-r1"
 MONITOR_BUILD_ID = "MONITOR_SALDO_PRO_REAL_SERIES_GUARD"
 MIN_POINTS_FOR_LINE = 2
+SHOW_LAST_MARKER = True
+SHOW_EXTREME_MARKERS = False
 
 
 
@@ -504,7 +506,7 @@ class DataEngine:
         sday = real_series[real_series["timestamp"] >= dcut].copy() if not real_series.empty else pd.DataFrame(columns=["timestamp", "equity"])
         if not sday.empty:
             try:
-                sday_daily = sday.set_index("timestamp").resample("1d").last().dropna().reset_index()
+                sday_daily = sday.set_index("timestamp").resample("1D").last().dropna().reset_index()
                 if len(sday_daily) >= MIN_POINTS_FOR_LINE:
                     sday = sday_daily
                 else:
@@ -693,8 +695,11 @@ class DashboardWindow(QtWidgets.QMainWindow):
             txt.setText("")
 
         marker_size = 8 if len(x) == 1 else 6
-        last.setData([x[-1]], [y[-1]], symbolSize=marker_size)
-        if len(x) >= 8:
+        if SHOW_LAST_MARKER:
+            last.setData([x[-1]], [y[-1]], symbolSize=marker_size)
+        else:
+            last.setData([], [])
+        if SHOW_EXTREME_MARKERS and len(x) >= 8:
             imax = int(np.argmax(y)); imin = int(np.argmin(y))
             vmax.setData([x[imax]], [y[imax]])
             vmin.setData([x[imin]], [y[imin]])
