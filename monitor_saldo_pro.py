@@ -62,6 +62,7 @@ Y_SCALE_MODE = os.getenv("Y_SCALE_MODE", "manual").strip().lower()  # manual | a
 Y_AXIS_MIN_USD = float(os.getenv("Y_AXIS_MIN_USD", "0"))
 Y_AXIS_MAX_USD = float(os.getenv("Y_AXIS_MAX_USD", "300"))
 Y_AUTO_SPAN_USD = float(os.getenv("Y_AUTO_SPAN_USD", "120"))
+MAIN_SAMPLE_RULE = os.getenv("MAIN_SAMPLE_RULE", "1min").strip() or "1min"
 
 
 
@@ -190,6 +191,7 @@ class Snapshot:
     last_update: Optional[datetime]
     now: datetime
     series_real: pd.DataFrame
+    series_main: pd.DataFrame
     series_minutes: pd.DataFrame
     series_hours: pd.DataFrame
     series_days: pd.DataFrame
@@ -530,6 +532,7 @@ class DataEngine:
         hcut = now - timedelta(hours=VENTANA_HORAS)
         dcut = now - timedelta(days=VENTANA_DIAS)
 
+        smain = _sample_window_series(real_series, dcut, primary_rule=MAIN_SAMPLE_RULE, fallback_rule="5min")
         smin = _sample_window_series(real_series, mcut, primary_rule="20s")
         shrs = _sample_window_series(real_series, hcut, primary_rule="2min")
         sday = _sample_window_series(real_series, dcut, primary_rule="1D", fallback_rule="6h")
@@ -543,6 +546,7 @@ class DataEngine:
             last_update=last_update,
             now=now,
             series_real=real_series,
+            series_main=smain,
             series_minutes=smin,
             series_hours=shrs,
             series_days=sday,
@@ -591,17 +595,17 @@ class DashboardWindow(QtWidgets.QMainWindow):
         root.addWidget(header)
 
         self.graphics = pg.GraphicsLayoutWidget(); root.addWidget(self.graphics, 1)
-        self.p_min = self.graphics.addPlot(row=0, col=0, axisItems={"bottom": SmartDateAxis("bottom"), "left": MoneyAxis("left")})
-        self.p_hour = self.graphics.addPlot(row=1, col=0, axisItems={"bottom": SmartDateAxis("bottom"), "left": MoneyAxis("left")})
-        self.p_day = self.graphics.addPlot(row=2, col=0, axisItems={"bottom": SmartDateAxis("bottom"), "left": MoneyAxis("left")})
+        self.p_main = self.graphics.addPlot(row=0, col=0, colspan=2, axisItems={"bottom": SmartDateAxis("bottom"), "left": MoneyAxis("left")})
+        self.p_min = self.graphics.addPlot(row=1, col=0, axisItems={"bottom": SmartDateAxis("bottom"), "left": MoneyAxis("left")})
+        self.p_day = self.graphics.addPlot(row=1, col=1, axisItems={"bottom": SmartDateAxis("bottom"), "left": MoneyAxis("left")})
 
-        self._style_plot(self.p_min, "MINUTOS · lectura rápida")
-        self._style_plot(self.p_hour, "HORAS · comportamiento reciente")
-        self._style_plot(self.p_day, "DÍAS · tendencia general")
+        self._style_plot(self.p_main, "EQUITY CURVE PRINCIPAL · dinero vs tiempo")
+        self._style_plot(self.p_min, "MINUTOS · detalle")
+        self._style_plot(self.p_day, "DÍAS · tendencia")
 
         self.plot_states = {
+            "main": self._init_plot_state(self.p_main, "#5df2ff", "#d9fbff"),
             "min": self._init_plot_state(self.p_min, "#3fe9ff", "#c6f7ff"),
-            "hour": self._init_plot_state(self.p_hour, "#7aa6ff", "#dae3ff"),
             "day": self._init_plot_state(self.p_day, "#7ff0b9", "#dcffe9"),
         }
 
@@ -683,7 +687,7 @@ class DashboardWindow(QtWidgets.QMainWindow):
         elif k == QtCore.Qt.Key_P:
             self.paused = not self.paused; self.refresh(force=True)
         elif k == QtCore.Qt.Key_R:
-            self.p_min.enableAutoRange(); self.p_hour.enableAutoRange(); self.p_day.enableAutoRange()
+            self.p_main.enableAutoRange(); self.p_min.enableAutoRange(); self.p_day.enableAutoRange()
         elif k == QtCore.Qt.Key_Q:
             self.close()
         else:
@@ -767,8 +771,8 @@ class DashboardWindow(QtWidgets.QMainWindow):
                 self.lbl_source.setObjectName("BadgeNeutral"); self.lbl_big.setStyleSheet("color:#d8e7ff;")
             self.lbl_source.style().unpolish(self.lbl_source); self.lbl_source.style().polish(self.lbl_source)
 
+            self._update_plot_state(self.plot_states["main"], snap.series_main)
             self._update_plot_state(self.plot_states["min"], snap.series_minutes)
-            self._update_plot_state(self.plot_states["hour"], snap.series_hours)
             self._update_plot_state(self.plot_states["day"], snap.series_days)
 
             if snap.warnings:
