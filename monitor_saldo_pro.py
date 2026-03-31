@@ -58,6 +58,8 @@ MONITOR_BUILD_ID = "MONITOR_SALDO_PRO_REAL_SERIES_GUARD"
 MIN_POINTS_FOR_LINE = 2
 SHOW_LAST_MARKER = True
 SHOW_EXTREME_MARKERS = False
+Y_AXIS_MIN_USD = 0.0
+Y_AXIS_MAX_USD = 300.0
 
 
 
@@ -503,6 +505,11 @@ class DataEngine:
 
         smin = real_series[real_series["timestamp"] >= mcut].copy() if not real_series.empty else pd.DataFrame(columns=["timestamp", "equity"])
         shrs = real_series[real_series["timestamp"] >= hcut].copy() if not real_series.empty else pd.DataFrame(columns=["timestamp", "equity"])
+        if not shrs.empty and len(shrs) > 240:
+            try:
+                shrs = shrs.set_index("timestamp").resample("2min").last().dropna().reset_index()
+            except Exception:
+                shrs = shrs.copy()
         sday = real_series[real_series["timestamp"] >= dcut].copy() if not real_series.empty else pd.DataFrame(columns=["timestamp", "equity"])
         if not sday.empty:
             try:
@@ -633,6 +640,8 @@ class DashboardWindow(QtWidgets.QMainWindow):
         for ax in (plot.getAxis("left"), plot.getAxis("bottom")):
             ax.setTextPen(pg.mkPen("#b9d0ee")); ax.setPen(pg.mkPen("#35506f"))
         plot.addLegend(offset=(5, 5), labelTextSize="7pt")
+        plot.setYRange(Y_AXIS_MIN_USD, Y_AXIS_MAX_USD, padding=0.0)
+        plot.setLimits(yMin=Y_AXIS_MIN_USD, yMax=Y_AXIS_MAX_USD)
 
     def _init_plot_state(self, plot: pg.PlotItem, color: str, endpoint: str) -> Dict[str, object]:
         glow = plot.plot([], [], pen=pg.mkPen(color + "55", width=8.0), name=None)
@@ -706,19 +715,7 @@ class DashboardWindow(QtWidgets.QMainWindow):
         else:
             vmax.setData([], [])
             vmin.setData([], [])
-        y_recent = y[-min(len(y), 60):]
-        q_low = float(np.nanpercentile(y_recent, 10))
-        q_high = float(np.nanpercentile(y_recent, 90))
-        y_min = float(np.min(y_recent))
-        y_max = float(np.max(y_recent))
-        lower = min(y_min, q_low)
-        upper = max(y_max, q_high)
-        span = upper - lower
-        if span <= 0.0:
-            pad = max(0.05, abs(upper) * 0.005)
-        else:
-            pad = max(0.05, span * 0.28)
-        plot.setYRange(round(lower - pad, 2), round(upper + pad, 2), padding=0.0)
+        plot.setYRange(Y_AXIS_MIN_USD, Y_AXIS_MAX_USD, padding=0.0)
 
     def refresh(self, force: bool = False):
         if self.paused and not force:
