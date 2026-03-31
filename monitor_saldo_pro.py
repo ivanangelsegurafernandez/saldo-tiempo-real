@@ -308,52 +308,56 @@ class DashboardWindow(QtWidgets.QMainWindow):
         cw = QtWidgets.QWidget()
         self.setCentralWidget(cw)
         root = QtWidgets.QVBoxLayout(cw)
-        root.setContentsMargins(8, 8, 8, 8)
-        root.setSpacing(8)
+        root.setContentsMargins(10, 10, 10, 10)
+        root.setSpacing(10)
+
+        header = QtWidgets.QFrame()
+        header.setObjectName("HeaderCard")
+        header_layout = QtWidgets.QVBoxLayout(header)
+        header_layout.setContentsMargins(16, 14, 16, 14)
+        header_layout.setSpacing(12)
 
         top_row = QtWidgets.QHBoxLayout()
+        top_row.setSpacing(10)
         self.lbl_title = QtWidgets.QLabel("SALDO REAL DERIV ACTUAL")
         self.lbl_title.setObjectName("Title")
         self.lbl_source = QtWidgets.QLabel("FUENTE: --")
-        self.lbl_source.setObjectName("BadgeNeutral")
+        self.lbl_source.setObjectName("BadgeWarn")
         top_row.addWidget(self.lbl_title, 1)
         top_row.addWidget(self.lbl_source, 0)
-        root.addLayout(top_row)
+        header_layout.addLayout(top_row)
 
         self.lbl_big = QtWidgets.QLabel("--")
         self.lbl_big.setObjectName("Big")
         self.lbl_big.setAlignment(QtCore.Qt.AlignCenter)
-        root.addWidget(self.lbl_big)
+        self.lbl_big.setMinimumHeight(118)
+        header_layout.addWidget(self.lbl_big)
 
         meta_row = QtWidgets.QHBoxLayout()
+        meta_row.setSpacing(10)
         self.lbl_refresh = QtWidgets.QLabel("REFRESCO: ACTIVO")
         self.lbl_refresh.setObjectName("MetaBox")
         self.lbl_now = QtWidgets.QLabel("HORA ACTUAL: --")
-        self.lbl_now.setObjectName("MetaBox")
+        self.lbl_now.setObjectName("MetaNow")
         self.lbl_last = QtWidgets.QLabel("ÚLTIMA ACT: --")
-        self.lbl_last.setObjectName("MetaBox")
+        self.lbl_last.setObjectName("MetaLast")
         meta_row.addWidget(self.lbl_refresh)
-        meta_row.addWidget(self.lbl_now)
+        meta_row.addWidget(self.lbl_now, 1)
         meta_row.addWidget(self.lbl_last)
-        root.addLayout(meta_row)
+        header_layout.addLayout(meta_row)
+        root.addWidget(header)
 
         self.graphics = pg.GraphicsLayoutWidget()
         root.addWidget(self.graphics, 1)
 
         self.p_min = self.graphics.addPlot(row=0, col=0, axisItems={"bottom": SmartDateAxis("bottom")})
-        self.p_min.setTitle("MINUTOS")
-        self.p_min.setLabel("left", "Dinero (USD)")
-        self.p_min.showGrid(x=True, y=True, alpha=0.08)
+        self._style_plot(self.p_min, "MINUTOS · lectura rápida")
 
         self.p_hour = self.graphics.addPlot(row=1, col=0, axisItems={"bottom": SmartDateAxis("bottom")})
-        self.p_hour.setTitle("HORAS")
-        self.p_hour.setLabel("left", "Dinero (USD)")
-        self.p_hour.showGrid(x=True, y=True, alpha=0.08)
+        self._style_plot(self.p_hour, "HORAS · comportamiento reciente")
 
         self.p_day = self.graphics.addPlot(row=2, col=0, axisItems={"bottom": SmartDateAxis("bottom")})
-        self.p_day.setTitle("DÍAS")
-        self.p_day.setLabel("left", "Dinero (USD)")
-        self.p_day.showGrid(x=True, y=True, alpha=0.08)
+        self._style_plot(self.p_day, "DÍAS · tendencia general")
 
         self.lbl_warn = QtWidgets.QLabel("")
         self.lbl_warn.setObjectName("Warn")
@@ -366,15 +370,20 @@ class DashboardWindow(QtWidgets.QMainWindow):
         self.setStyleSheet(
             """
             QMainWindow, QWidget { background: #0b0f14; color: #d9e2f2; }
-            #Title { font-size: 18px; color: #9ec2ff; font-weight: 700; letter-spacing: 0.4px; }
-            #Big { font-size: 76px; color: #ffffff; font-weight: 900; padding: 8px 0; }
-            #MetaBox { font-size: 13px; color: #cde0ff; background: #132034; border: 1px solid #23415f; border-radius: 8px; padding: 6px 10px; }
-            #BadgeNeutral { font-size: 13px; color: #d9e2f2; background: #1c2a3a; border: 1px solid #415a75; border-radius: 12px; padding: 4px 10px; font-weight: 700; }
-            #BadgeGood { font-size: 13px; color: #06341c; background: #73f7b3; border: 1px solid #88ffc1; border-radius: 12px; padding: 4px 10px; font-weight: 800; }
-            #BadgeWarn { font-size: 13px; color: #3d2a00; background: #ffd67f; border: 1px solid #ffe09e; border-radius: 12px; padding: 4px 10px; font-weight: 800; }
-            #BadgeBad { font-size: 13px; color: #3d0000; background: #ff8f8f; border: 1px solid #ffaaaa; border-radius: 12px; padding: 4px 10px; font-weight: 800; }
-            #Warn { font-size: 12px; color: #ffb86b; }
-            #Help { font-size: 11px; color: #9fb7d9; }
+            #HeaderCard { background: #0f1622; border: 1px solid #203047; border-radius: 14px; }
+            #Title { font-size: 20px; color: #b9d3ff; font-weight: 800; letter-spacing: 0.6px; }
+            #Big { font-size: 98px; color: #ecfff3; font-weight: 900; padding: 10px 0 14px 0; }
+            #MetaBox { font-size: 14px; color: #bdd6ff; background: #101e31; border: 1px solid #263e5f; border-radius: 10px; padding: 8px 12px; font-weight: 650; }
+            #MetaNow { font-size: 18px; color: #ecf6ff; background: #153153; border: 1px solid #2f5e92; border-radius: 10px; padding: 8px 14px; font-weight: 800; }
+            #MetaLast { font-size: 14px; color: #d9e8ff; background: #12263d; border: 1px solid #2c4b72; border-radius: 10px; padding: 8px 12px; font-weight: 650; }
+            #BadgeMaster { font-size: 13px; color: #041d13; background: #72f8b1; border: 1px solid #9dffd0; border-radius: 13px; padding: 4px 11px; font-weight: 900; }
+            #BadgeObserved { font-size: 13px; color: #02222b; background: #67efff; border: 1px solid #8ff6ff; border-radius: 13px; padding: 4px 11px; font-weight: 850; }
+            #BadgeLive { font-size: 13px; color: #0b2a1f; background: #9ef7d8; border: 1px solid #c0ffe8; border-radius: 13px; padding: 4px 11px; font-weight: 850; }
+            #BadgeNeutral { font-size: 13px; color: #d8e7ff; background: #23364f; border: 1px solid #3d5c81; border-radius: 13px; padding: 4px 11px; font-weight: 800; }
+            #BadgeWarn { font-size: 13px; color: #3d2a00; background: #ffd67f; border: 1px solid #ffe09e; border-radius: 13px; padding: 4px 11px; font-weight: 850; }
+            #BadgeBad { font-size: 13px; color: #390000; background: #ff9c9c; border: 1px solid #ffb8b8; border-radius: 13px; padding: 4px 11px; font-weight: 850; }
+            #Warn { font-size: 12px; color: #ffc374; font-weight: 600; }
+            #Help { font-size: 10px; color: #7690b2; }
             """
         )
         pg.setConfigOptions(antialias=True, background="#0b0f14", foreground="#d9e2f2")
@@ -412,14 +421,26 @@ class DashboardWindow(QtWidgets.QMainWindow):
             super().keyPressEvent(ev)
 
     @staticmethod
-    def _plot_series(plot: pg.PlotItem, s: pd.DataFrame, color="#66d9ff"):
+    def _style_plot(plot: pg.PlotItem, title: str):
+        plot.setTitle(f"<span style='color:#cfe2ff;font-size:13pt;font-weight:700'>{title}</span>")
+        plot.setLabel("left", "Dinero (USD)")
+        plot.showGrid(x=True, y=True, alpha=0.05)
+        axis_left = plot.getAxis("left")
+        axis_bottom = plot.getAxis("bottom")
+        axis_left.setTextPen(pg.mkPen("#b9d0ee"))
+        axis_bottom.setTextPen(pg.mkPen("#a8bfdc"))
+        axis_left.setPen(pg.mkPen("#35506f"))
+        axis_bottom.setPen(pg.mkPen("#35506f"))
+
+    @staticmethod
+    def _plot_series(plot: pg.PlotItem, s: pd.DataFrame, color="#66d9ff", endpoint="#d8ff6e"):
         plot.clear()
         if s.empty:
             return
         x = (s["timestamp"].astype("int64") / 1e9).to_numpy(dtype=float)
         y = s["equity"].to_numpy(dtype=float)
-        plot.plot(x, y, pen=pg.mkPen(color, width=2.0))
-        plot.plot([x[-1]], [y[-1]], pen=None, symbol="o", symbolSize=7, symbolBrush="#d8ff6e")
+        plot.plot(x, y, pen=pg.mkPen(color, width=2.8))
+        plot.plot([x[-1]], [y[-1]], pen=pg.mkPen("#ffffff33"), symbol="o", symbolSize=9, symbolBrush=endpoint)
 
     def refresh(self, force: bool = False):
         if self.paused and not force:
@@ -435,24 +456,30 @@ class DashboardWindow(QtWidgets.QMainWindow):
 
             src = snap.source.upper().strip()
             self.lbl_source.setText(f"FUENTE: {src}")
-            if src in ("MAESTRO", "OBSERVADO", "LIVE"):
-                self.lbl_source.setObjectName("BadgeGood")
-                self.lbl_big.setStyleSheet("color:#f7fff9;")
+            if src == "MAESTRO":
+                self.lbl_source.setObjectName("BadgeMaster")
+                self.lbl_big.setStyleSheet("color:#72f8b1;")
+            elif src == "OBSERVADO":
+                self.lbl_source.setObjectName("BadgeObserved")
+                self.lbl_big.setStyleSheet("color:#67efff;")
+            elif src == "LIVE":
+                self.lbl_source.setObjectName("BadgeLive")
+                self.lbl_big.setStyleSheet("color:#9ef7d8;")
             elif src == "STALE":
                 self.lbl_source.setObjectName("BadgeWarn")
-                self.lbl_big.setStyleSheet("color:#fff5df;")
+                self.lbl_big.setStyleSheet("color:#ffe9b8;")
             elif src in ("ESTIMADO", "SIN DATOS REALES"):
                 self.lbl_source.setObjectName("BadgeBad")
-                self.lbl_big.setStyleSheet("color:#ffe9e9;")
+                self.lbl_big.setStyleSheet("color:#ffb9b9;")
             else:
                 self.lbl_source.setObjectName("BadgeNeutral")
-                self.lbl_big.setStyleSheet("color:#f1f6ff;")
+                self.lbl_big.setStyleSheet("color:#d8e7ff;")
             self.lbl_source.style().unpolish(self.lbl_source)
             self.lbl_source.style().polish(self.lbl_source)
 
-            self._plot_series(self.p_min, snap.series_minutes, color="#66f3ff")
-            self._plot_series(self.p_hour, snap.series_hours, color="#66b7ff")
-            self._plot_series(self.p_day, snap.series_days, color="#7effb7")
+            self._plot_series(self.p_min, snap.series_minutes, color="#69f5ff", endpoint="#ccfbff")
+            self._plot_series(self.p_hour, snap.series_hours, color="#7ca8ff", endpoint="#d7e2ff")
+            self._plot_series(self.p_day, snap.series_days, color="#7ff0b9", endpoint="#dcffe9")
 
             # curva estimada solo auxiliar y tenue (si no hay real)
             if snap.series_minutes.empty and not snap.series_est.empty:
@@ -461,7 +488,11 @@ class DashboardWindow(QtWidgets.QMainWindow):
                 y = aux["equity"].to_numpy(dtype=float)
                 self.p_hour.plot(x, y, pen=pg.mkPen("#888888", width=1.0, style=QtCore.Qt.DashLine))
 
-            self.lbl_warn.setText("⚠ " + " | ".join(snap.warnings[:4]) if snap.warnings else "")
+            if snap.warnings:
+                compact = [w.strip()[:96] + ("…" if len(w.strip()) > 96 else "") for w in snap.warnings[:2]]
+                self.lbl_warn.setText("⚠ " + " | ".join(compact))
+            else:
+                self.lbl_warn.setText("")
         except Exception as e:
             self.lbl_warn.setText(f"⚠ Error monitor: {e}")
             traceback.print_exc()
