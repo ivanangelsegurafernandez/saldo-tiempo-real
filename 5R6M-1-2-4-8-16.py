@@ -15669,6 +15669,7 @@ def _persistir_saldo_series_csv(payload: dict, now_utc: datetime, event_type: st
 
 
 def _persistir_saldo_live():
+    global SALDO_CSV_AGG_CACHE
     try:
         now_utc = datetime.now(timezone.utc)
         payload = {

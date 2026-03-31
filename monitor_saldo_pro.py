@@ -30,6 +30,7 @@ import numpy as np
 import pandas as pd
 import pyqtgraph as pg
 from PySide6 import QtCore, QtGui, QtWidgets
+from saldo_csv_tools import refresh_aggregate_csvs
 
 # ------------------------ Config ------------------------
 CUENTA_OBJETIVO = "REAL"  # REAL | DEMO | ALL
@@ -215,6 +216,7 @@ class DataEngine:
         self.base_dir = base_dir
         self._cache: Dict[str, Tuple[Tuple, object]] = {}
         self._history_last_seen: Optional[Tuple[str, int, int]] = None
+        self._agg_cache_state: Dict[str, object] = {}
 
     @staticmethod
     def _sig(paths: List[Path]) -> Tuple:
@@ -518,6 +520,7 @@ class DataEngine:
             warnings.append(hist_msg)
 
         if view == "REAL":
+            self._validate_balance_csvs(warnings)
             warnings.append(f"Monitor {MONITOR_VERSION} · id={MONITOR_BUILD_ID}")
             warnings.append(f"Ruta snapshot real: {live_path_used if live_path_used else SALDO_LIVE_SHARED_PATH}")
             warnings.append(f"Ruta histórico real: {hist_path_used if hist_path_used else SALDO_LIVE_HISTORY_SHARED_PATH}")
