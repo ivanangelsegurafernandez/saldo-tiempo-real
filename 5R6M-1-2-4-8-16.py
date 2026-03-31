@@ -15661,6 +15661,31 @@ def _persistir_saldo_live():
             pass
 
 
+def _persistir_saldo_live():
+    """Persistencia atómica del saldo real para monitores externos."""
+    try:
+        target = SALDO_LIVE_SHARED_PATH
+        target_dir = os.path.dirname(target) or "."
+        os.makedirs(target_dir, exist_ok=True)
+        payload = {
+            "saldo_real": float(SALDO_LAST_VALID_VALUE) if SALDO_LAST_VALID_VALUE is not None else None,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "status": str(SALDO_STATUS),
+            "source": "MAESTRO_DERIV",
+            "last_valid_ts": float(SALDO_LAST_VALID_TS or 0.0),
+        }
+        tmp = f"{target}.tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False)
+        os.replace(tmp, target)
+    except Exception as e:
+        # No tumbar maestro por fallo de persistencia.
+        try:
+            print(f"⚠️ No se pudo persistir saldo live ({SALDO_LIVE_SHARED_PATH}): {e}")
+        except Exception:
+            pass
+
+
 # Obtener saldo real
 async def obtener_saldo_real():
     global saldo_real, ULTIMA_ACT_SALDO, SALDO_LAST_VALID_VALUE, SALDO_LAST_VALID_TS
