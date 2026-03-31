@@ -58,8 +58,10 @@ MONITOR_BUILD_ID = "MONITOR_SALDO_PRO_REAL_SERIES_GUARD"
 MIN_POINTS_FOR_LINE = 2
 SHOW_LAST_MARKER = True
 SHOW_EXTREME_MARKERS = False
-Y_AXIS_MIN_USD = 0.0
-Y_AXIS_MAX_USD = 300.0
+Y_SCALE_MODE = os.getenv("Y_SCALE_MODE", "manual").strip().lower()  # manual | auto
+Y_AXIS_MIN_USD = float(os.getenv("Y_AXIS_MIN_USD", "0"))
+Y_AXIS_MAX_USD = float(os.getenv("Y_AXIS_MAX_USD", "300"))
+Y_AUTO_SPAN_USD = float(os.getenv("Y_AUTO_SPAN_USD", "120"))
 
 
 
@@ -99,6 +101,31 @@ def _sanitize_series_for_plot(s: pd.DataFrame) -> pd.DataFrame:
     d = d.dropna(subset=["timestamp", "equity"]).sort_values("timestamp")
     d = d.drop_duplicates(subset=["timestamp"], keep="last")
     return d.reset_index(drop=True)
+
+
+def _sample_window_series(
+    series: pd.DataFrame,
+    cutoff: datetime,
+    primary_rule: Optional[str],
+    fallback_rule: Optional[str] = None,
+) -> pd.DataFrame:
+    base = series[series["timestamp"] >= cutoff].copy() if not series.empty else pd.DataFrame(columns=["timestamp", "equity"])
+    if base.empty or primary_rule is None:
+        return base
+    try:
+        sampled = base.set_index("timestamp").resample(primary_rule).last().dropna().reset_index()
+        if len(sampled) >= MIN_POINTS_FOR_LINE:
+            return sampled
+    except Exception:
+        pass
+    if fallback_rule:
+        try:
+            sampled_fb = base.set_index("timestamp").resample(fallback_rule).last().dropna().reset_index()
+            if len(sampled_fb) >= MIN_POINTS_FOR_LINE:
+                return sampled_fb
+        except Exception:
+            pass
+    return base
 
 
 def _safe_float(x, default=np.nan):
@@ -503,34 +530,12 @@ class DataEngine:
         hcut = now - timedelta(hours=VENTANA_HORAS)
         dcut = now - timedelta(days=VENTANA_DIAS)
 
-        smin = real_series[real_series["timestamp"] >= mcut].copy() if not real_series.empty else pd.DataFrame(columns=["timestamp", "equity"])
-        shrs = real_series[real_series["timestamp"] >= hcut].copy() if not real_series.empty else pd.DataFrame(columns=["timestamp", "equity"])
-        if not shrs.empty and len(shrs) > 240:
-            try:
-                shrs = shrs.set_index("timestamp").resample("2min").last().dropna().reset_index()
-            except Exception:
-                shrs = shrs.copy()
-        sday = real_series[real_series["timestamp"] >= dcut].copy() if not real_series.empty else pd.DataFrame(columns=["timestamp", "equity"])
-        if not sday.empty:
-            try:
-                sday_daily = sday.set_index("timestamp").resample("1D").last().dropna().reset_index()
-                if len(sday_daily) >= MIN_POINTS_FOR_LINE:
-                    sday = sday_daily
-                else:
-                    try:
-                        sday_fallback = sday.set_index("timestamp").resample("6h").last().dropna().reset_index()
-                        if len(sday_fallback) >= MIN_POINTS_FOR_LINE:
-                            sday = sday_fallback
-                            warnings.append("Panel DÍAS en fallback 6h: histórico diario aún insuficiente")
-                        else:
-                            sday = sday.tail(min(120, len(sday))).copy()
-                            warnings.append("Panel DÍAS en fallback crudo: histórico diario aún insuficiente")
-                    except Exception as e_fallback:
-                        sday = sday.tail(min(120, len(sday))).copy()
-                        warnings.append(f"Fallback 6h DÍAS no disponible: {e_fallback}")
-            except Exception as e_daily:
-                sday = sday.tail(min(120, len(sday))).copy()
-                warnings.append(f"Resample diario DÍAS no disponible: {e_daily}")
+        smin = _sample_window_series(real_series, mcut, primary_rule="20s")
+        shrs = _sample_window_series(real_series, hcut, primary_rule="2min")
+        sday = _sample_window_series(real_series, dcut, primary_rule="1D", fallback_rule="6h")
+        if not sday.empty and len(sday) < MIN_POINTS_FOR_LINE:
+            sday = sday.tail(min(120, len(sday))).copy()
+            warnings.append("Panel DÍAS en fallback crudo: histórico diario aún insuficiente")
 
         return Snapshot(
             source=source,
@@ -640,8 +645,20 @@ class DashboardWindow(QtWidgets.QMainWindow):
         for ax in (plot.getAxis("left"), plot.getAxis("bottom")):
             ax.setTextPen(pg.mkPen("#b9d0ee")); ax.setPen(pg.mkPen("#35506f"))
         plot.addLegend(offset=(5, 5), labelTextSize="7pt")
-        plot.setYRange(Y_AXIS_MIN_USD, Y_AXIS_MAX_USD, padding=0.0)
-        plot.setLimits(yMin=Y_AXIS_MIN_USD, yMax=Y_AXIS_MAX_USD)
+        y0, y1 = self._resolve_y_range(None)
+        plot.setYRange(y0, y1, padding=0.0)
+        plot.setLimits(yMin=y0, yMax=y1)
+
+    def _resolve_y_range(self, y: Optional[np.ndarray]) -> Tuple[float, float]:
+        if Y_SCALE_MODE == "manual":
+            return float(Y_AXIS_MIN_USD), float(Y_AXIS_MAX_USD)
+        if y is None or len(y) == 0:
+            return 0.0, float(max(10.0, Y_AUTO_SPAN_USD))
+        center = float(np.nanmedian(y))
+        span = float(max(10.0, Y_AUTO_SPAN_USD))
+        y0 = max(0.0, center - span * 0.5)
+        y1 = y0 + span
+        return y0, y1
 
     def _init_plot_state(self, plot: pg.PlotItem, color: str, endpoint: str) -> Dict[str, object]:
         glow = plot.plot([], [], pen=pg.mkPen(color + "55", width=8.0), name=None)
@@ -715,7 +732,8 @@ class DashboardWindow(QtWidgets.QMainWindow):
         else:
             vmax.setData([], [])
             vmin.setData([], [])
-        plot.setYRange(Y_AXIS_MIN_USD, Y_AXIS_MAX_USD, padding=0.0)
+        y0, y1 = self._resolve_y_range(y)
+        plot.setYRange(y0, y1, padding=0.0)
 
     def refresh(self, force: bool = False):
         if self.paused and not force:
