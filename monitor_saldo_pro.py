@@ -557,7 +557,7 @@ class DashboardWindow(QtWidgets.QMainWindow):
         hl = QtWidgets.QVBoxLayout(header); hl.setContentsMargins(16, 14, 16, 14); hl.setSpacing(12)
 
         top = QtWidgets.QHBoxLayout(); top.setSpacing(10)
-        self.lbl_title = QtWidgets.QLabel("SALDO REAL DERIV ACTUAL"); self.lbl_title.setObjectName("Title")
+        self.lbl_title = QtWidgets.QLabel(f"SALDO REAL DERIV ACTUAL · {MONITOR_VERSION}"); self.lbl_title.setObjectName("Title")
         self.lbl_source = QtWidgets.QLabel("FUENTE: --"); self.lbl_source.setObjectName("BadgeWarn")
         top.addWidget(self.lbl_title, 1); top.addWidget(self.lbl_source, 0)
         hl.addLayout(top)
@@ -571,7 +571,8 @@ class DashboardWindow(QtWidgets.QMainWindow):
         self.lbl_refresh = QtWidgets.QLabel("REFRESCO: ACTIVO"); self.lbl_refresh.setObjectName("MetaBox")
         self.lbl_now = QtWidgets.QLabel("HORA LOCAL: --"); self.lbl_now.setObjectName("MetaNow")
         self.lbl_last = QtWidgets.QLabel("ÚLTIMA ACT: --"); self.lbl_last.setObjectName("MetaLast")
-        meta.addWidget(self.lbl_refresh); meta.addWidget(self.lbl_now, 1); meta.addWidget(self.lbl_last)
+        self.lbl_build = QtWidgets.QLabel(f"BUILD: {MONITOR_BUILD_ID}"); self.lbl_build.setObjectName("MetaBox")
+        meta.addWidget(self.lbl_refresh); meta.addWidget(self.lbl_now, 1); meta.addWidget(self.lbl_last); meta.addWidget(self.lbl_build)
         hl.addLayout(meta)
         root.addWidget(header)
 
