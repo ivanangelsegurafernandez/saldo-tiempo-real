@@ -62,7 +62,6 @@ Y_SCALE_MODE = os.getenv("Y_SCALE_MODE", "manual").strip().lower()  # manual | a
 Y_AXIS_MIN_USD = float(os.getenv("Y_AXIS_MIN_USD", "0"))
 Y_AXIS_MAX_USD = float(os.getenv("Y_AXIS_MAX_USD", "300"))
 Y_AUTO_SPAN_USD = float(os.getenv("Y_AUTO_SPAN_USD", "120"))
-MAIN_SAMPLE_RULE = os.getenv("MAIN_SAMPLE_RULE", "1min").strip() or "1min"
 
 
 
@@ -107,26 +106,31 @@ def _sanitize_series_for_plot(s: pd.DataFrame) -> pd.DataFrame:
 def _sample_window_series(
     series: pd.DataFrame,
     cutoff: datetime,
-    primary_rule: Optional[str],
-    fallback_rule: Optional[str] = None,
+    target_points: int,
 ) -> pd.DataFrame:
-    base = series[series["timestamp"] >= cutoff].copy() if not series.empty else pd.DataFrame(columns=["timestamp", "equity"])
-    if base.empty or primary_rule is None:
+    base = _sanitize_series_for_plot(series[series["timestamp"] >= cutoff].copy()) if not series.empty else pd.DataFrame(columns=["timestamp", "equity"])
+    if base.empty or len(base) <= max(4, target_points):
         return base
     try:
-        sampled = base.set_index("timestamp").resample(primary_rule).last().dropna().reset_index()
-        if len(sampled) >= MIN_POINTS_FOR_LINE:
-            return sampled
+        t_sec = (base["timestamp"].astype("int64") // 1_000_000_000).to_numpy(dtype=np.int64)
+        span = int(max(1, t_sec[-1] - t_sec[0]))
+        bucket_s = max(1, span // max(1, int(target_points)))
+        bucket_id = (t_sec - t_sec[0]) // bucket_s
+        df = base.reset_index(drop=True).copy()
+        df["bucket_id"] = bucket_id
+        keep_idx = set()
+        for _, g in df.groupby("bucket_id", sort=True):
+            if g.empty:
+                continue
+            keep_idx.add(int(g.index[0]))   # first
+            keep_idx.add(int(g.index[-1]))  # last
+            keep_idx.add(int(g["equity"].idxmin()))  # min
+            keep_idx.add(int(g["equity"].idxmax()))  # max
+        sampled = df.loc[sorted(keep_idx), ["timestamp", "equity"]]
+        sampled = sampled.drop_duplicates(subset=["timestamp", "equity"], keep="last").sort_values("timestamp")
+        return sampled.reset_index(drop=True)
     except Exception:
-        pass
-    if fallback_rule:
-        try:
-            sampled_fb = base.set_index("timestamp").resample(fallback_rule).last().dropna().reset_index()
-            if len(sampled_fb) >= MIN_POINTS_FOR_LINE:
-                return sampled_fb
-        except Exception:
-            pass
-    return base
+        return base
 
 
 def _safe_float(x, default=np.nan):
@@ -532,10 +536,10 @@ class DataEngine:
         hcut = now - timedelta(hours=VENTANA_HORAS)
         dcut = now - timedelta(days=VENTANA_DIAS)
 
-        smain = _sample_window_series(real_series, dcut, primary_rule=MAIN_SAMPLE_RULE, fallback_rule="5min")
-        smin = _sample_window_series(real_series, mcut, primary_rule="20s")
-        shrs = _sample_window_series(real_series, hcut, primary_rule="2min")
-        sday = _sample_window_series(real_series, dcut, primary_rule="1D", fallback_rule="6h")
+        smain = _sample_window_series(real_series, dcut, target_points=900)
+        smin = _sample_window_series(real_series, mcut, target_points=420)
+        shrs = _sample_window_series(real_series, hcut, target_points=520)
+        sday = _sample_window_series(real_series, dcut, target_points=360)
         if not sday.empty and len(sday) < MIN_POINTS_FOR_LINE:
             sday = sday.tail(min(120, len(sday))).copy()
             warnings.append("Panel DÍAS en fallback crudo: histórico diario aún insuficiente")
