@@ -24,6 +24,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
+from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
@@ -42,6 +43,8 @@ LOG_SALDOS = "LOG_SALDOS"
 CSV_PATTERN = "registro_enriquecido_fulll*.csv"
 SALDO_LIVE_FILE = "saldo_real_live.json"
 SALDO_LIVE_HISTORY_FILE = "saldo_real_live_history.jsonl"
+SALDO_SERIES_CSV_FILE = "saldo_real_series.csv"
+DISPLAY_TIMEZONE = "America/Lima"
 SALDO_LIVE_SHARED_PATH = os.path.abspath(
     os.getenv("SALDO_LIVE_SHARED_PATH", os.path.join(os.path.expanduser("~"), SALDO_LIVE_FILE))
 )
@@ -64,11 +67,12 @@ Y_AXIS_MAX_USD = float(os.getenv("Y_AXIS_MAX_USD", "300"))
 Y_AUTO_SPAN_USD = float(os.getenv("Y_AUTO_SPAN_USD", "120"))
 CAPITAL_BASE_USD = float(os.getenv("CAPITAL_BASE_USD", "0") or "0")
 MIN_X_SPAN_SECONDS = 20.0
+DISPLAY_TZ = ZoneInfo(DISPLAY_TIMEZONE)
 
 
 
 def _now() -> datetime:
-    return datetime.now().astimezone()
+    return datetime.now(timezone.utc).astimezone(DISPLAY_TZ)
 
 
 def _fmt_money(v: Optional[float]) -> str:
@@ -84,11 +88,11 @@ def _fmt_local_ts(ts_obj) -> str:
         if isinstance(ts_obj, pd.Timestamp):
             if ts_obj.tzinfo is None:
                 ts_obj = ts_obj.tz_localize("UTC")
-            return ts_obj.to_pydatetime().astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
+            return ts_obj.to_pydatetime().astimezone(DISPLAY_TZ).strftime("%Y-%m-%d %H:%M:%S %Z")
         if isinstance(ts_obj, datetime):
             if ts_obj.tzinfo is None:
                 ts_obj = ts_obj.replace(tzinfo=timezone.utc)
-            return ts_obj.astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
+            return ts_obj.astimezone(DISPLAY_TZ).strftime("%Y-%m-%d %H:%M:%S %Z")
     except Exception:
         return "--"
     return "--"
@@ -166,7 +170,7 @@ class SmartDateAxis(pg.DateAxisItem):
                     out.append("")
                     continue
                 dt_utc = datetime.fromtimestamp(float(v), tz=timezone.utc)
-                dt_local = dt_utc.astimezone()
+                dt_local = dt_utc.astimezone(DISPLAY_TZ)
                 if span <= 15 * 60:
                     label = dt_local.strftime("%H:%M:%S")
                 elif span <= 6 * 3600:
@@ -243,6 +247,22 @@ class DataEngine:
         cands: List[Path] = [Path(SALDO_LIVE_HISTORY_SHARED_PATH).expanduser()]
         for p in self._master_live_candidates():
             cands.append(p.parent / SALDO_LIVE_HISTORY_FILE)
+        out: List[Path] = []
+        seen = set()
+        for p in cands:
+            k = str(p)
+            if k not in seen:
+                seen.add(k)
+                out.append(p)
+        return out
+
+    def _master_series_candidates(self) -> List[Path]:
+        base = Path(SALDO_LIVE_SHARED_PATH).expanduser().parent
+        cands: List[Path] = [Path(os.getenv("SALDO_SERIES_CSV_PATH", str(base / SALDO_SERIES_CSV_FILE))).expanduser()]
+        for p in self._master_live_candidates():
+            cands.append(p.parent / SALDO_SERIES_CSV_FILE)
+        cands.append(self.base_dir / SALDO_SERIES_CSV_FILE)
+        cands.append(Path.cwd() / SALDO_SERIES_CSV_FILE)
         out: List[Path] = []
         seen = set()
         for p in cands:
@@ -332,6 +352,34 @@ class DataEngine:
             sig,
             (pd.DataFrame(columns=["timestamp", "equity"]), f"Sin histórico real: no se encontró {SALDO_LIVE_HISTORY_FILE} en ruta compartida: {SALDO_LIVE_HISTORY_SHARED_PATH}", None, None),
         )
+
+    def _read_master_series(self) -> Tuple[pd.DataFrame, Optional[str], Optional[Path]]:
+        paths = self._master_series_candidates()
+        sig = self._sig(paths)
+        cached = self._cached("series_csv", sig)
+        if cached is not None:
+            return cached
+        for p in paths:
+            if not p.exists():
+                continue
+            try:
+                rows = []
+                with p.open("r", encoding="utf-8", errors="ignore", newline="") as fh:
+                    reader = pd.read_csv(fh)
+                if "saldo_real" not in reader.columns:
+                    continue
+                ts = pd.to_datetime(reader.get("ts_utc"), errors="coerce", utc=True)
+                if ts.isna().all() and "epoch" in reader.columns:
+                    ts = pd.to_datetime(pd.to_numeric(reader["epoch"], errors="coerce"), unit="s", errors="coerce", utc=True)
+                vals = pd.to_numeric(reader["saldo_real"], errors="coerce")
+                d = pd.DataFrame({"timestamp": ts, "equity": vals}).dropna(subset=["timestamp", "equity"])
+                if d.empty:
+                    continue
+                d = d.sort_values("timestamp").drop_duplicates(subset=["timestamp", "equity"], keep="last")
+                return self._store_cache("series_csv", sig, (d, None, p))
+            except Exception:
+                return self._store_cache("series_csv", sig, (pd.DataFrame(columns=["timestamp", "equity"]), f"{SALDO_SERIES_CSV_FILE} inválido", p))
+        return self._store_cache("series_csv", sig, (pd.DataFrame(columns=["timestamp", "equity"]), None, None))
 
     def _check_history_growth(self, path: Path, valid_rows: int) -> Optional[str]:
         try:
@@ -460,6 +508,7 @@ class DataEngine:
 
         master, master_msg, live_path_used = self._read_master_live() if view == "REAL" else (None, None, None)
         hist, hist_msg, hist_path_used, hist_growth_msg = self._read_master_history() if view == "REAL" else (pd.DataFrame(columns=["timestamp", "equity"]), None, None, None)
+        series_csv, series_msg, series_path_used = self._read_master_series() if view == "REAL" else (pd.DataFrame(columns=["timestamp", "equity"]), None, None)
         observed = self._parse_observed(view)
         estimated = self._build_estimated(view)
 
@@ -470,10 +519,12 @@ class DataEngine:
 
         if view == "REAL":
             warnings.append(f"Monitor {MONITOR_VERSION} · id={MONITOR_BUILD_ID}")
-            if not hasattr(self, "_check_history_growth"):
-                warnings.append("Versión desactualizada detectada: faltan validaciones de crecimiento de histórico")
             warnings.append(f"Ruta snapshot real: {live_path_used if live_path_used else SALDO_LIVE_SHARED_PATH}")
             warnings.append(f"Ruta histórico real: {hist_path_used if hist_path_used else SALDO_LIVE_HISTORY_SHARED_PATH}")
+            if series_msg:
+                warnings.append(series_msg)
+            if series_path_used:
+                warnings.append(f"Ruta serie CSV real: {series_path_used}")
             warnings.append(
                 f"Estado snapshot: {'OK' if live_path_used and Path(live_path_used).exists() else 'NO ENCONTRADO'} | "
                 f"Estado histórico: {'OK' if hist_path_used and Path(hist_path_used).exists() else 'NO ENCONTRADO'}"
@@ -509,6 +560,11 @@ class DataEngine:
             saldo_actual = mv
             last_update = mts
             real_series = pd.DataFrame([{"timestamp": mts, "equity": mv}])
+        elif view == "REAL" and not series_csv.empty:
+            source = "SERIE_CSV"
+            saldo_actual = float(series_csv["equity"].iloc[-1])
+            last_update = series_csv["timestamp"].iloc[-1]
+            real_series = series_csv
         elif not observed.empty:
             source = "OBSERVADO"
             saldo_actual = float(observed["equity"].iloc[-1])
@@ -594,10 +650,16 @@ class DashboardWindow(QtWidgets.QMainWindow):
         meta = QtWidgets.QHBoxLayout(); meta.setSpacing(10)
         self.lbl_refresh = QtWidgets.QLabel("REFRESCO: ACTIVO"); self.lbl_refresh.setObjectName("MetaBox")
         self.lbl_scale = QtWidgets.QLabel("ESCALA Y: --"); self.lbl_scale.setObjectName("MetaBox")
+        self.lbl_delta = QtWidgets.QLabel("Δ VIS: --"); self.lbl_delta.setObjectName("MetaBox")
+        self.lbl_samples = QtWidgets.QLabel("MUESTRAS: --"); self.lbl_samples.setObjectName("MetaBox")
+        self.lbl_tz = QtWidgets.QLabel(f"TZ: {DISPLAY_TIMEZONE}"); self.lbl_tz.setObjectName("MetaBox")
         self.lbl_now = QtWidgets.QLabel("HORA LOCAL: --"); self.lbl_now.setObjectName("MetaNow")
         self.lbl_last = QtWidgets.QLabel("ÚLTIMA ACT: --"); self.lbl_last.setObjectName("MetaLast")
         meta.addWidget(self.lbl_refresh)
         meta.addWidget(self.lbl_scale)
+        meta.addWidget(self.lbl_delta)
+        meta.addWidget(self.lbl_samples)
+        meta.addWidget(self.lbl_tz)
         meta.addWidget(self.lbl_now, 1)
         meta.addWidget(self.lbl_last)
         hl.addLayout(meta)
@@ -799,7 +861,7 @@ class DashboardWindow(QtWidgets.QMainWindow):
             snap = self.engine.build_snapshot(self.view)
             self.lbl_big.setText(_fmt_money(snap.saldo_actual))
             refresh_state = "PAUSADO" if self.paused else "ACTIVO"
-            last = snap.last_update.astimezone().strftime("%Y-%m-%d %H:%M:%S %Z") if snap.last_update else "--"
+            last = snap.last_update.astimezone(DISPLAY_TZ).strftime("%Y-%m-%d %H:%M:%S %Z") if snap.last_update else "--"
             self.lbl_refresh.setText(f"REFRESCO: {refresh_state}")
             self.lbl_now.setText(f"HORA LOCAL: {snap.now.strftime('%H:%M:%S %Z')}")
             self.lbl_last.setText(f"ÚLTIMA ACT: {last}")
@@ -808,7 +870,7 @@ class DashboardWindow(QtWidgets.QMainWindow):
             self.lbl_source.setText(f"FUENTE: {src}")
             if src == "MAESTRO":
                 self.lbl_source.setObjectName("BadgeMaster"); self.lbl_big.setStyleSheet("color:#72f8b1;")
-            elif src in ("OBSERVADO", "MAESTRO_HIST"):
+            elif src in ("OBSERVADO", "MAESTRO_HIST", "SERIE_CSV"):
                 self.lbl_source.setObjectName("BadgeObserved"); self.lbl_big.setStyleSheet("color:#67efff;")
             elif src == "LIVE":
                 self.lbl_source.setObjectName("BadgeLive"); self.lbl_big.setStyleSheet("color:#9ef7d8;")
@@ -822,8 +884,20 @@ class DashboardWindow(QtWidgets.QMainWindow):
 
             main_scale = self._update_plot_state(self.plot_states["main"], snap.series_main)
             self._update_plot_state(self.plot_states["min"], snap.series_minutes)
+            self._update_plot_state(self.plot_states["hour"], snap.series_hours)
             self._update_plot_state(self.plot_states["day"], snap.series_days)
             self.lbl_scale.setText(f"ESCALA Y: {main_scale}")
+            visible = _sanitize_series_for_plot(snap.series_main)
+            n_visible = int(len(visible))
+            if n_visible >= 1:
+                first = float(visible["equity"].iloc[0])
+                last_v = float(visible["equity"].iloc[-1])
+                delta = last_v - first
+                pct = (delta / first * 100.0) if abs(first) > 1e-12 else 0.0
+                self.lbl_delta.setText(f"Δ VIS: {delta:+,.2f} USD ({pct:+.2f}%)")
+            else:
+                self.lbl_delta.setText("Δ VIS: --")
+            self.lbl_samples.setText(f"MUESTRAS: {n_visible}")
 
             if snap.warnings:
                 compact = [w.strip()[:110] + ("…" if len(w.strip()) > 110 else "") for w in snap.warnings[:3]]

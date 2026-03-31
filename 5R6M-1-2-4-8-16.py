@@ -37,6 +37,7 @@ from collections import deque
 from unicodedata import normalize
 import threading
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 from contextlib import contextmanager
 import sys
 import shutil
@@ -1358,6 +1359,11 @@ SALDO_LIVE_HISTORY_SHARED_PATH = os.path.abspath(
         os.path.join(os.path.dirname(SALDO_LIVE_SHARED_PATH), SALDO_LIVE_HISTORY_FILE),
     )
 )
+SALDO_SERIES_CSV_FILE = "saldo_real_series.csv"
+SALDO_SERIES_CSV_PATH = os.path.abspath(
+    os.getenv("SALDO_SERIES_CSV_PATH", os.path.join(os.path.dirname(SALDO_LIVE_SHARED_PATH), SALDO_SERIES_CSV_FILE))
+)
+SALDO_DISPLAY_TZ = ZoneInfo("America/Lima")
 meta_mostrada = False
 eventos_recentes = deque(maxlen=8)
 reinicio_forzado = asyncio.Event()
@@ -15595,6 +15601,73 @@ def _set_saldo_status(status: str, reason: str, detail: str = "", announce: bool
             agregar_evento(msg)
 
 
+def _persistir_saldo_series_csv(payload: dict, now_utc: datetime, event_type: str):
+    csv_path = SALDO_SERIES_CSV_PATH
+    os.makedirs(os.path.dirname(csv_path) or ".", exist_ok=True)
+    cols = ["ts_utc", "ts_lima", "epoch", "saldo_real", "status", "source", "event_type"]
+    saldo_val = payload.get("saldo_real", None)
+    if saldo_val is None:
+        return
+    try:
+        saldo_val = float(saldo_val)
+    except Exception:
+        return
+
+    ts_utc = str(payload.get("timestamp", "")).strip() or now_utc.isoformat()
+    try:
+        dt_utc = datetime.fromisoformat(ts_utc.replace("Z", "+00:00"))
+        if dt_utc.tzinfo is None:
+            dt_utc = dt_utc.replace(tzinfo=timezone.utc)
+        dt_utc = dt_utc.astimezone(timezone.utc)
+    except Exception:
+        dt_utc = now_utc
+    dt_lima = dt_utc.astimezone(SALDO_DISPLAY_TZ)
+
+    row = {
+        "ts_utc": dt_utc.isoformat(),
+        "ts_lima": dt_lima.isoformat(),
+        "epoch": f"{float(dt_utc.timestamp()):.6f}",
+        "saldo_real": f"{saldo_val:.10f}",
+        "status": str(payload.get("status", "")),
+        "source": str(payload.get("source", "")),
+        "event_type": str(event_type),
+    }
+
+    last_ts = ""
+    last_saldo = None
+    if os.path.exists(csv_path) and os.path.getsize(csv_path) > 0:
+        try:
+            with open(csv_path, "r", encoding="utf-8", errors="ignore", newline="") as f:
+                reader = csv.DictReader(f)
+                for r in reader:
+                    if not r:
+                        continue
+                    last_ts = str(r.get("ts_utc", "")).strip() or last_ts
+                    try:
+                        last_saldo = float(r.get("saldo_real"))
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+    if last_ts == row["ts_utc"] and last_saldo is not None and abs(last_saldo - saldo_val) <= 1e-12:
+        return
+
+    write_header = (not os.path.exists(csv_path)) or os.path.getsize(csv_path) <= 0
+    try:
+        with open(csv_path, "a", encoding="utf-8", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=cols)
+            if write_header:
+                writer.writeheader()
+            writer.writerow(row)
+            f.flush()
+            try:
+                os.fsync(f.fileno())
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
 def _persistir_saldo_live():
     try:
         now_utc = datetime.now(timezone.utc)
@@ -15658,6 +15731,7 @@ def _persistir_saldo_live():
                     os.fsync(hf.fileno())
                 except Exception:
                     pass
+            _persistir_saldo_series_csv(payload, now_utc, append_reason)
     except Exception as e:
         try:
             print(f"⚠️ No se pudo persistir saldo live/hist: {e}")
