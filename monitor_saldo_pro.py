@@ -503,17 +503,25 @@ class DataEngine:
         shrs = real_series[real_series["timestamp"] >= hcut].copy() if not real_series.empty else pd.DataFrame(columns=["timestamp", "equity"])
         sday = real_series[real_series["timestamp"] >= dcut].copy() if not real_series.empty else pd.DataFrame(columns=["timestamp", "equity"])
         if not sday.empty:
-            sday_daily = sday.set_index("timestamp").resample("1D").last().dropna().reset_index()
-            if len(sday_daily) >= MIN_POINTS_FOR_LINE:
-                sday = sday_daily
-            else:
-                sday_fallback = sday.set_index("timestamp").resample("6H").last().dropna().reset_index()
-                if len(sday_fallback) >= MIN_POINTS_FOR_LINE:
-                    sday = sday_fallback
-                    warnings.append("Panel DÍAS en fallback 6H: histórico diario aún insuficiente")
+            try:
+                sday_daily = sday.set_index("timestamp").resample("1d").last().dropna().reset_index()
+                if len(sday_daily) >= MIN_POINTS_FOR_LINE:
+                    sday = sday_daily
                 else:
-                    sday = sday.tail(min(120, len(sday))).copy()
-                    warnings.append("Panel DÍAS en fallback crudo: histórico diario aún insuficiente")
+                    try:
+                        sday_fallback = sday.set_index("timestamp").resample("6h").last().dropna().reset_index()
+                        if len(sday_fallback) >= MIN_POINTS_FOR_LINE:
+                            sday = sday_fallback
+                            warnings.append("Panel DÍAS en fallback 6h: histórico diario aún insuficiente")
+                        else:
+                            sday = sday.tail(min(120, len(sday))).copy()
+                            warnings.append("Panel DÍAS en fallback crudo: histórico diario aún insuficiente")
+                    except Exception as e_fallback:
+                        sday = sday.tail(min(120, len(sday))).copy()
+                        warnings.append(f"Fallback 6h DÍAS no disponible: {e_fallback}")
+            except Exception as e_daily:
+                sday = sday.tail(min(120, len(sday))).copy()
+                warnings.append(f"Resample diario DÍAS no disponible: {e_daily}")
 
         return Snapshot(
             source=source,
