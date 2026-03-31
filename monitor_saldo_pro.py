@@ -24,13 +24,31 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
-from zoneinfo import ZoneInfo
+try:
+    from zoneinfo import ZoneInfo
+except Exception:
+    ZoneInfo = None
 
-import numpy as np
-import pandas as pd
-import pyqtgraph as pg
-from PySide6 import QtCore, QtGui, QtWidgets
-from saldo_csv_tools import refresh_aggregate_csvs
+try:
+    import numpy as np
+except Exception as e:
+    print(f"[MONITOR][ERROR] Dependencia faltante o inválida: numpy ({e})")
+    raise
+try:
+    import pandas as pd
+except Exception as e:
+    print(f"[MONITOR][ERROR] Dependencia faltante o inválida: pandas ({e})")
+    raise
+try:
+    import pyqtgraph as pg
+except Exception as e:
+    print(f"[MONITOR][ERROR] Dependencia faltante o inválida: pyqtgraph ({e})")
+    raise
+try:
+    from PySide6 import QtCore, QtGui, QtWidgets
+except Exception as e:
+    print(f"[MONITOR][ERROR] Dependencia faltante o inválida: PySide6 ({e})")
+    raise
 
 # ------------------------ Config ------------------------
 CUENTA_OBJETIVO = "REAL"  # REAL | DEMO | ALL
@@ -69,6 +87,18 @@ Y_AUTO_SPAN_USD = float(os.getenv("Y_AUTO_SPAN_USD", "120"))
 CAPITAL_BASE_USD = float(os.getenv("CAPITAL_BASE_USD", "0") or "0")
 MIN_X_SPAN_SECONDS = 20.0
 DISPLAY_TZ = ZoneInfo(DISPLAY_TIMEZONE)
+
+
+def _safe_display_tz():
+    if ZoneInfo is None:
+        return timezone.utc
+    try:
+        return ZoneInfo(DISPLAY_TIMEZONE)
+    except Exception:
+        return timezone.utc
+
+
+DISPLAY_TZ = _safe_display_tz()
 
 
 
@@ -916,11 +946,16 @@ class DashboardWindow(QtWidgets.QMainWindow):
 
 def main():
     print(f"[MONITOR] Monitor Saldo Real Deriv {MONITOR_VERSION} · build={MONITOR_BUILD_ID}")
-    app = QtWidgets.QApplication(sys.argv)
-    w = DashboardWindow(DataEngine(Path(__file__).resolve().parent))
-    w.show()
-    sys.exit(app.exec())
+    try:
+        app = QtWidgets.QApplication(sys.argv)
+        w = DashboardWindow(DataEngine(Path(__file__).resolve().parent))
+        w.show()
+        return int(app.exec())
+    except Exception:
+        print("[MONITOR][ERROR] Falló el arranque del monitor.")
+        traceback.print_exc()
+        return 1
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

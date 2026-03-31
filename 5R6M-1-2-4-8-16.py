@@ -37,7 +37,10 @@ from collections import deque
 from unicodedata import normalize
 import threading
 from datetime import datetime, timedelta, timezone
-from zoneinfo import ZoneInfo
+try:
+    from zoneinfo import ZoneInfo
+except Exception:
+    ZoneInfo = None
 from contextlib import contextmanager
 import sys
 import shutil
@@ -1363,7 +1366,15 @@ SALDO_SERIES_CSV_FILE = "saldo_real_series.csv"
 SALDO_SERIES_CSV_PATH = os.path.abspath(
     os.getenv("SALDO_SERIES_CSV_PATH", os.path.join(os.path.dirname(SALDO_LIVE_SHARED_PATH), SALDO_SERIES_CSV_FILE))
 )
-SALDO_DISPLAY_TZ = ZoneInfo("America/Lima")
+def _safe_saldo_display_tz():
+    if ZoneInfo is None:
+        return timezone.utc
+    try:
+        return ZoneInfo("America/Lima")
+    except Exception:
+        return timezone.utc
+
+SALDO_DISPLAY_TZ = _safe_saldo_display_tz()
 meta_mostrada = False
 eventos_recentes = deque(maxlen=8)
 reinicio_forzado = asyncio.Event()
@@ -15669,7 +15680,6 @@ def _persistir_saldo_series_csv(payload: dict, now_utc: datetime, event_type: st
 
 
 def _persistir_saldo_live():
-    global SALDO_CSV_AGG_CACHE
     try:
         now_utc = datetime.now(timezone.utc)
         payload = {
