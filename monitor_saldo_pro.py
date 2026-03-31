@@ -46,6 +46,9 @@ FULLSCREEN_INICIAL = False
 LOG_SALDOS = "LOG_SALDOS"
 CSV_PATTERN = "registro_enriquecido_fulll*.csv"
 SALDO_LIVE_FILE = "saldo_real_live.json"
+SALDO_LIVE_SHARED_PATH = os.path.abspath(
+    os.getenv("SALDO_LIVE_SHARED_PATH", os.path.join(os.path.expanduser("~"), SALDO_LIVE_FILE))
+)
 SALDO_LIVE_PATH = os.getenv("SALDO_LIVE_PATH", "").strip()
 
 
@@ -107,7 +110,7 @@ class DataEngine:
         self.base_dir = base_dir
 
     def _master_live_candidates(self) -> List[Path]:
-        candidates: List[Path] = []
+        candidates: List[Path] = [Path(SALDO_LIVE_SHARED_PATH).expanduser()]
         if SALDO_LIVE_PATH:
             custom = Path(SALDO_LIVE_PATH).expanduser()
             candidates.append(custom / SALDO_LIVE_FILE if custom.is_dir() else custom)
@@ -135,17 +138,23 @@ class DataEngine:
                 obj = json.loads(p.read_text(encoding="utf-8", errors="ignore"))
                 v = _safe_float(obj.get("saldo_real"), default=np.nan)
                 if not np.isfinite(v):
+                    if str(p) == str(Path(SALDO_LIVE_SHARED_PATH)):
+                        return None, f"{SALDO_LIVE_FILE} inválido en ruta compartida: {p}"
                     return None, f"{SALDO_LIVE_FILE} inválido en {p}"
                 ts = pd.to_datetime(obj.get("timestamp"), errors="coerce", utc=True)
                 if pd.isna(ts):
                     ts = pd.to_datetime(p.stat().st_mtime, unit="s", utc=True)
                 return (float(v), ts.to_pydatetime()), None
             except Exception:
+                if str(p) == str(Path(SALDO_LIVE_SHARED_PATH)):
+                    return None, f"{SALDO_LIVE_FILE} inválido en ruta compartida: {p}"
                 return None, f"{SALDO_LIVE_FILE} inválido en {p}"
 
         configured = SALDO_LIVE_PATH if SALDO_LIVE_PATH else "(no configurada; usando ruta local/cwd)"
         if not found_any:
-            return None, f"{SALDO_LIVE_FILE} no encontrado en ruta configurada: {configured}"
+            return None, f"{SALDO_LIVE_FILE} no encontrado en ruta compartida: {SALDO_LIVE_SHARED_PATH}"
+        if not Path(SALDO_LIVE_SHARED_PATH).exists():
+            return None, f"{SALDO_LIVE_FILE} no encontrado en ruta compartida: {SALDO_LIVE_SHARED_PATH} (fallback: {configured})"
         return None, f"saldo real del maestro no disponible ({SALDO_LIVE_FILE})"
 
     def _parse_observed(self, view: str) -> pd.DataFrame:

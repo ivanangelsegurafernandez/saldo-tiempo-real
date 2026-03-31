@@ -36,7 +36,7 @@ import os, csv, time, random, asyncio, json, re
 from collections import deque
 from unicodedata import normalize
 import threading
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from contextlib import contextmanager
 import sys
 import shutil
@@ -1348,6 +1348,9 @@ SALDO_LAST_VALID_TS = 0.0
 SALDO_LAST_EVENT_KEY = ""
 SALDO_LAST_EVENT_TS = 0.0
 SALDO_LIVE_FILE = "saldo_real_live.json"
+SALDO_LIVE_SHARED_PATH = os.path.abspath(
+    os.getenv("SALDO_LIVE_SHARED_PATH", os.path.join(os.path.expanduser("~"), SALDO_LIVE_FILE))
+)
 meta_mostrada = False
 eventos_recentes = deque(maxlen=8)
 reinicio_forzado = asyncio.Event()
@@ -15587,6 +15590,9 @@ def _set_saldo_status(status: str, reason: str, detail: str = "", announce: bool
 def _persistir_saldo_live():
     """Persistencia atómica del saldo real para monitores externos."""
     try:
+        target = SALDO_LIVE_SHARED_PATH
+        target_dir = os.path.dirname(target) or "."
+        os.makedirs(target_dir, exist_ok=True)
         payload = {
             "saldo_real": float(SALDO_LAST_VALID_VALUE) if SALDO_LAST_VALID_VALUE is not None else None,
             "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -15594,14 +15600,14 @@ def _persistir_saldo_live():
             "source": "MAESTRO_DERIV",
             "last_valid_ts": float(SALDO_LAST_VALID_TS or 0.0),
         }
-        tmp = f"{SALDO_LIVE_FILE}.tmp"
+        tmp = f"{target}.tmp"
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(payload, f, ensure_ascii=False)
-        os.replace(tmp, SALDO_LIVE_FILE)
+        os.replace(tmp, target)
     except Exception as e:
         # No tumbar maestro por fallo de persistencia.
         try:
-            print(f"⚠️ No se pudo persistir saldo live ({SALDO_LIVE_FILE}): {e}")
+            print(f"⚠️ No se pudo persistir saldo live ({SALDO_LIVE_SHARED_PATH}): {e}")
         except Exception:
             pass
 
