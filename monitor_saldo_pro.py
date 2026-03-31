@@ -92,6 +92,11 @@ class SmartDateAxis(pg.DateAxisItem):
         return out
 
 
+class MoneyAxis(pg.AxisItem):
+    def tickStrings(self, values, scale, spacing):
+        return [f"{v:,.2f}" for v in values]
+
+
 @dataclass
 class Snapshot:
     source: str
@@ -455,9 +460,9 @@ class DashboardWindow(QtWidgets.QMainWindow):
         root.addWidget(header)
 
         self.graphics = pg.GraphicsLayoutWidget(); root.addWidget(self.graphics, 1)
-        self.p_min = self.graphics.addPlot(row=0, col=0, axisItems={"bottom": SmartDateAxis("bottom")})
-        self.p_hour = self.graphics.addPlot(row=1, col=0, axisItems={"bottom": SmartDateAxis("bottom")})
-        self.p_day = self.graphics.addPlot(row=2, col=0, axisItems={"bottom": SmartDateAxis("bottom")})
+        self.p_min = self.graphics.addPlot(row=0, col=0, axisItems={"bottom": SmartDateAxis("bottom"), "left": MoneyAxis("left")})
+        self.p_hour = self.graphics.addPlot(row=1, col=0, axisItems={"bottom": SmartDateAxis("bottom"), "left": MoneyAxis("left")})
+        self.p_day = self.graphics.addPlot(row=2, col=0, axisItems={"bottom": SmartDateAxis("bottom"), "left": MoneyAxis("left")})
 
         self._style_plot(self.p_min, "MINUTOS · lectura rápida")
         self._style_plot(self.p_hour, "HORAS · comportamiento reciente")
@@ -545,6 +550,7 @@ class DashboardWindow(QtWidgets.QMainWindow):
         super().changeEvent(ev)
 
     def _update_plot_state(self, state: Dict[str, object], s: pd.DataFrame):
+        plot = state["plot"]
         line = state["line"]; last = state["last"]; vmax = state["max"]; vmin = state["min"]; txt = state["text"]
         if s.empty:
             line.setData([], [])
@@ -570,13 +576,23 @@ class DashboardWindow(QtWidgets.QMainWindow):
         imax = int(np.argmax(y)); imin = int(np.argmin(y))
         vmax.setData([x[imax]], [y[imax]])
         vmin.setData([x[imin]], [y[imin]])
+        ymin = float(np.min(y))
+        ymax = float(np.max(y))
+        span = ymax - ymin
+        if span <= 0.0:
+            pad = max(0.05, abs(ymax) * 0.005)
+            plot.setYRange(round(ymin - pad, 2), round(ymax + pad, 2), padding=0.0)
+        elif span < max(0.1, abs(ymax) * 0.002):
+            pad = max(0.05, span * 2.0)
+            plot.setYRange(round(ymin - pad, 2), round(ymax + pad, 2), padding=0.0)
+        else:
+            plot.enableAutoRange(axis=plot.getViewBox().YAxis)
 
     def refresh(self, force: bool = False):
         if self.paused and not force:
             return
         if self.isMinimized() and not force:
-            # Al minimizar evitamos render pesado, solo actualizamos estado textual en ciclos largos.
-            pass
+            return
         try:
             snap = self.engine.build_snapshot(self.view)
             self.lbl_big.setText(_fmt_money(snap.saldo_actual))
