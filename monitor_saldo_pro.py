@@ -79,17 +79,32 @@ class SmartDateAxis(pg.DateAxisItem):
     def tickStrings(self, values, scale, spacing):
         if not values:
             return []
-        local_tz = datetime.now().astimezone().tzinfo
-        span = max(values) - min(values)
+        finite_vals = [v for v in values if isinstance(v, (int, float, np.floating)) and np.isfinite(v)]
+        if not finite_vals:
+            return ["" for _ in values]
+        span = max(finite_vals) - min(finite_vals)
         out = []
         for v in values:
-            dt = datetime.fromtimestamp(v, tz=local_tz)
-            if span <= 6 * 3600:
-                out.append(dt.strftime("%H:%M"))
-            elif span <= 48 * 3600:
-                out.append(dt.strftime("%d-%m %H:%M"))
-            else:
-                out.append(dt.strftime("%d-%m"))
+            try:
+                if not isinstance(v, (int, float, np.floating)) or not np.isfinite(v):
+                    out.append("")
+                    continue
+                # Rango seguro para datetime (aprox. 0001..9999 en segundos epoch)
+                if v < -62135596800 or v > 253402300799:
+                    out.append("")
+                    continue
+                dt_utc = datetime.fromtimestamp(float(v), tz=timezone.utc)
+                dt_local = dt_utc.astimezone()
+                if span <= 15 * 60:
+                    out.append(dt_local.strftime("%H:%M:%S"))
+                elif span <= 6 * 3600:
+                    out.append(dt_local.strftime("%H:%M"))
+                elif span <= 48 * 3600:
+                    out.append(dt_local.strftime("%d-%m %H:%M"))
+                else:
+                    out.append(dt_local.strftime("%d-%m"))
+            except Exception:
+                out.append("")
         return out
 
 
