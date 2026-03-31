@@ -86,6 +86,7 @@ Y_AXIS_MAX_USD = float(os.getenv("Y_AXIS_MAX_USD", "300"))
 Y_AUTO_SPAN_USD = float(os.getenv("Y_AUTO_SPAN_USD", "120"))
 CAPITAL_BASE_USD = float(os.getenv("CAPITAL_BASE_USD", "0") or "0")
 MIN_X_SPAN_SECONDS = 20.0
+DISPLAY_TZ = ZoneInfo(DISPLAY_TIMEZONE)
 
 
 def _safe_display_tz():
@@ -245,6 +246,7 @@ class DataEngine:
         self.base_dir = base_dir
         self._cache: Dict[str, Tuple[Tuple, object]] = {}
         self._history_last_seen: Optional[Tuple[str, int, int]] = None
+        self._agg_cache_state: Dict[str, object] = {}
 
     @staticmethod
     def _sig(paths: List[Path]) -> Tuple:
@@ -548,6 +550,7 @@ class DataEngine:
             warnings.append(hist_msg)
 
         if view == "REAL":
+            self._validate_balance_csvs(warnings)
             warnings.append(f"Monitor {MONITOR_VERSION} · id={MONITOR_BUILD_ID}")
             warnings.append(f"Ruta snapshot real: {live_path_used if live_path_used else SALDO_LIVE_SHARED_PATH}")
             warnings.append(f"Ruta histórico real: {hist_path_used if hist_path_used else SALDO_LIVE_HISTORY_SHARED_PATH}")
