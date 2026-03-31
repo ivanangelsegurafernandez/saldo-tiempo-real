@@ -45,8 +45,6 @@ CSV_PATTERN = "registro_enriquecido_fulll*.csv"
 SALDO_LIVE_FILE = "saldo_real_live.json"
 SALDO_LIVE_HISTORY_FILE = "saldo_real_live_history.jsonl"
 SALDO_SERIES_CSV_FILE = "saldo_real_series.csv"
-SALDO_1MIN_CSV_FILE = "saldo_real_1min.csv"
-SALDO_1H_CSV_FILE = "saldo_real_1h.csv"
 DISPLAY_TIMEZONE = "America/Lima"
 SALDO_LIVE_SHARED_PATH = os.path.abspath(
     os.getenv("SALDO_LIVE_SHARED_PATH", os.path.join(os.path.expanduser("~"), SALDO_LIVE_FILE))
@@ -260,33 +258,21 @@ class DataEngine:
                 out.append(p)
         return out
 
-    def _saldo_series_paths(self) -> Tuple[Path, Path, Path]:
+    def _master_series_candidates(self) -> List[Path]:
         base = Path(SALDO_LIVE_SHARED_PATH).expanduser().parent
-        raw = Path(os.getenv("SALDO_SERIES_CSV_PATH", str(base / SALDO_SERIES_CSV_FILE))).expanduser()
-        p1 = Path(os.getenv("SALDO_1MIN_CSV_PATH", str(raw.parent / SALDO_1MIN_CSV_FILE))).expanduser()
-        p2 = Path(os.getenv("SALDO_1H_CSV_PATH", str(raw.parent / SALDO_1H_CSV_FILE))).expanduser()
-        return raw, p1, p2
-
-    def _validate_balance_csvs(self, warnings: List[str]) -> None:
-        raw_csv, min_csv, hour_csv = self._saldo_series_paths()
-        ok, msg, self._agg_cache_state = refresh_aggregate_csvs(
-            str(raw_csv), str(min_csv), str(hour_csv), self._agg_cache_state
-        )
-        if not ok and msg != "raw_missing":
-            warnings.append(f"CSV agregado no regenerado/validado: {msg}")
-        if raw_csv.exists():
-            if not min_csv.exists() or not hour_csv.exists():
-                warnings.append("CSV agregado faltante: revisar saldo_real_1min.csv / saldo_real_1h.csv")
-            hist_paths = self._master_history_candidates()
-            hist_path = next((p for p in hist_paths if p.exists()), None)
-            if hist_path and hist_path.exists():
-                try:
-                    raw_mtime = raw_csv.stat().st_mtime
-                    hist_mtime = hist_path.stat().st_mtime
-                    if raw_mtime + 2 < hist_mtime:
-                        warnings.append("CSV crudo desfasado respecto al histórico JSONL")
-                except Exception:
-                    pass
+        cands: List[Path] = [Path(os.getenv("SALDO_SERIES_CSV_PATH", str(base / SALDO_SERIES_CSV_FILE))).expanduser()]
+        for p in self._master_live_candidates():
+            cands.append(p.parent / SALDO_SERIES_CSV_FILE)
+        cands.append(self.base_dir / SALDO_SERIES_CSV_FILE)
+        cands.append(Path.cwd() / SALDO_SERIES_CSV_FILE)
+        out: List[Path] = []
+        seen = set()
+        for p in cands:
+            k = str(p)
+            if k not in seen:
+                seen.add(k)
+                out.append(p)
+        return out
 
     def _cached(self, key: str, sig: Tuple):
         old = self._cache.get(key)
@@ -368,6 +354,34 @@ class DataEngine:
             sig,
             (pd.DataFrame(columns=["timestamp", "equity"]), f"Sin histórico real: no se encontró {SALDO_LIVE_HISTORY_FILE} en ruta compartida: {SALDO_LIVE_HISTORY_SHARED_PATH}", None, None),
         )
+
+    def _read_master_series(self) -> Tuple[pd.DataFrame, Optional[str], Optional[Path]]:
+        paths = self._master_series_candidates()
+        sig = self._sig(paths)
+        cached = self._cached("series_csv", sig)
+        if cached is not None:
+            return cached
+        for p in paths:
+            if not p.exists():
+                continue
+            try:
+                rows = []
+                with p.open("r", encoding="utf-8", errors="ignore", newline="") as fh:
+                    reader = pd.read_csv(fh)
+                if "saldo_real" not in reader.columns:
+                    continue
+                ts = pd.to_datetime(reader.get("ts_utc"), errors="coerce", utc=True)
+                if ts.isna().all() and "epoch" in reader.columns:
+                    ts = pd.to_datetime(pd.to_numeric(reader["epoch"], errors="coerce"), unit="s", errors="coerce", utc=True)
+                vals = pd.to_numeric(reader["saldo_real"], errors="coerce")
+                d = pd.DataFrame({"timestamp": ts, "equity": vals}).dropna(subset=["timestamp", "equity"])
+                if d.empty:
+                    continue
+                d = d.sort_values("timestamp").drop_duplicates(subset=["timestamp", "equity"], keep="last")
+                return self._store_cache("series_csv", sig, (d, None, p))
+            except Exception:
+                return self._store_cache("series_csv", sig, (pd.DataFrame(columns=["timestamp", "equity"]), f"{SALDO_SERIES_CSV_FILE} inválido", p))
+        return self._store_cache("series_csv", sig, (pd.DataFrame(columns=["timestamp", "equity"]), None, None))
 
     def _check_history_growth(self, path: Path, valid_rows: int) -> Optional[str]:
         try:
@@ -496,6 +510,7 @@ class DataEngine:
 
         master, master_msg, live_path_used = self._read_master_live() if view == "REAL" else (None, None, None)
         hist, hist_msg, hist_path_used, hist_growth_msg = self._read_master_history() if view == "REAL" else (pd.DataFrame(columns=["timestamp", "equity"]), None, None, None)
+        series_csv, series_msg, series_path_used = self._read_master_series() if view == "REAL" else (pd.DataFrame(columns=["timestamp", "equity"]), None, None)
         observed = self._parse_observed(view)
         estimated = self._build_estimated(view)
 
@@ -507,10 +522,12 @@ class DataEngine:
         if view == "REAL":
             self._validate_balance_csvs(warnings)
             warnings.append(f"Monitor {MONITOR_VERSION} · id={MONITOR_BUILD_ID}")
-            if not hasattr(self, "_check_history_growth"):
-                warnings.append("Versión desactualizada detectada: faltan validaciones de crecimiento de histórico")
             warnings.append(f"Ruta snapshot real: {live_path_used if live_path_used else SALDO_LIVE_SHARED_PATH}")
             warnings.append(f"Ruta histórico real: {hist_path_used if hist_path_used else SALDO_LIVE_HISTORY_SHARED_PATH}")
+            if series_msg:
+                warnings.append(series_msg)
+            if series_path_used:
+                warnings.append(f"Ruta serie CSV real: {series_path_used}")
             warnings.append(
                 f"Estado snapshot: {'OK' if live_path_used and Path(live_path_used).exists() else 'NO ENCONTRADO'} | "
                 f"Estado histórico: {'OK' if hist_path_used and Path(hist_path_used).exists() else 'NO ENCONTRADO'}"
@@ -546,6 +563,11 @@ class DataEngine:
             saldo_actual = mv
             last_update = mts
             real_series = pd.DataFrame([{"timestamp": mts, "equity": mv}])
+        elif view == "REAL" and not series_csv.empty:
+            source = "SERIE_CSV"
+            saldo_actual = float(series_csv["equity"].iloc[-1])
+            last_update = series_csv["timestamp"].iloc[-1]
+            real_series = series_csv
         elif not observed.empty:
             source = "OBSERVADO"
             saldo_actual = float(observed["equity"].iloc[-1])
@@ -851,7 +873,7 @@ class DashboardWindow(QtWidgets.QMainWindow):
             self.lbl_source.setText(f"FUENTE: {src}")
             if src == "MAESTRO":
                 self.lbl_source.setObjectName("BadgeMaster"); self.lbl_big.setStyleSheet("color:#72f8b1;")
-            elif src in ("OBSERVADO", "MAESTRO_HIST"):
+            elif src in ("OBSERVADO", "MAESTRO_HIST", "SERIE_CSV"):
                 self.lbl_source.setObjectName("BadgeObserved"); self.lbl_big.setStyleSheet("color:#67efff;")
             elif src == "LIVE":
                 self.lbl_source.setObjectName("BadgeLive"); self.lbl_big.setStyleSheet("color:#9ef7d8;")
