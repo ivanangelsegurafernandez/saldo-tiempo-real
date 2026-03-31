@@ -46,8 +46,15 @@ FULLSCREEN_INICIAL = False
 LOG_SALDOS = "LOG_SALDOS"
 CSV_PATTERN = "registro_enriquecido_fulll*.csv"
 SALDO_LIVE_FILE = "saldo_real_live.json"
+SALDO_LIVE_HISTORY_FILE = "saldo_real_live_history.jsonl"
 SALDO_LIVE_SHARED_PATH = os.path.abspath(
     os.getenv("SALDO_LIVE_SHARED_PATH", os.path.join(os.path.expanduser("~"), SALDO_LIVE_FILE))
+)
+SALDO_LIVE_HISTORY_SHARED_PATH = os.path.abspath(
+    os.getenv(
+        "SALDO_LIVE_HISTORY_SHARED_PATH",
+        os.path.join(os.path.dirname(SALDO_LIVE_SHARED_PATH), SALDO_LIVE_HISTORY_FILE),
+    )
 )
 SALDO_LIVE_PATH = os.getenv("SALDO_LIVE_PATH", "").strip()
 
@@ -127,6 +134,20 @@ class DataEngine:
             unique.append(p)
         return unique
 
+    def _master_history_candidates(self) -> List[Path]:
+        candidates: List[Path] = [Path(SALDO_LIVE_HISTORY_SHARED_PATH).expanduser()]
+        for live_path in self._master_live_candidates():
+            candidates.append(live_path.parent / SALDO_LIVE_HISTORY_FILE)
+        unique: List[Path] = []
+        seen = set()
+        for p in candidates:
+            k = str(p.resolve()) if p.exists() else str(p)
+            if k in seen:
+                continue
+            seen.add(k)
+            unique.append(p)
+        return unique
+
     def _read_master_live(self) -> Tuple[Optional[Tuple[float, datetime]], Optional[str]]:
         candidates = self._master_live_candidates()
         found_any = False
@@ -156,6 +177,44 @@ class DataEngine:
         if not Path(SALDO_LIVE_SHARED_PATH).exists():
             return None, f"{SALDO_LIVE_FILE} no encontrado en ruta compartida: {SALDO_LIVE_SHARED_PATH} (fallback: {configured})"
         return None, f"saldo real del maestro no disponible ({SALDO_LIVE_FILE})"
+
+    def _read_master_history(self) -> Tuple[pd.DataFrame, Optional[str]]:
+        for p in self._master_history_candidates():
+            if not p.exists():
+                continue
+            try:
+                rows: List[Dict[str, object]] = []
+                with p.open("r", encoding="utf-8", errors="ignore") as fh:
+                    for line in fh:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        obj = json.loads(line)
+                        v = _safe_float(obj.get("saldo_real"), default=np.nan)
+                        if not np.isfinite(v):
+                            continue
+                        ts = pd.to_datetime(obj.get("timestamp"), errors="coerce", utc=True)
+                        if pd.isna(ts):
+                            continue
+                        rows.append(
+                            {
+                                "timestamp": ts.to_pydatetime(),
+                                "equity": float(v),
+                                "status": str(obj.get("status", "")),
+                                "source": str(obj.get("source", "MAESTRO_HIST")),
+                            }
+                        )
+                if not rows:
+                    continue
+                d = pd.DataFrame(rows).sort_values("timestamp")
+                d = d.drop_duplicates(subset=["timestamp", "equity"], keep="last")
+                return d[["timestamp", "equity"]], None
+            except Exception:
+                if str(p) == str(Path(SALDO_LIVE_HISTORY_SHARED_PATH)):
+                    return pd.DataFrame(columns=["timestamp", "equity"]), f"{SALDO_LIVE_HISTORY_FILE} inválido en ruta compartida: {p}"
+                return pd.DataFrame(columns=["timestamp", "equity"]), f"{SALDO_LIVE_HISTORY_FILE} inválido en {p}"
+
+        return pd.DataFrame(columns=["timestamp", "equity"]), f"{SALDO_LIVE_HISTORY_FILE} no encontrado en ruta compartida: {SALDO_LIVE_HISTORY_SHARED_PATH}"
 
     def _parse_observed(self, view: str) -> pd.DataFrame:
         patterns: List[re.Pattern]
@@ -264,17 +323,35 @@ class DataEngine:
         warnings: List[str] = []
 
         master, master_msg = self._read_master_live() if view == "REAL" else (None, None)
+        history, history_msg = self._read_master_history() if view == "REAL" else (pd.DataFrame(columns=["timestamp", "equity"]), None)
         observed = self._parse_observed(view)
         estimated = self._build_estimated(view)
         if master_msg and view == "REAL":
             warnings.append(master_msg)
+        if history_msg and view == "REAL":
+            warnings.append(history_msg)
 
         source = "SIN DATOS REALES"
         saldo_actual: Optional[float] = None
         last_update: Optional[datetime] = None
         real_series = pd.DataFrame(columns=["timestamp", "equity"])
 
-        if master is not None:
+        if view == "REAL" and not history.empty:
+            real_series = history.copy()
+            if master is not None:
+                mv, mts = master
+                source = "MAESTRO"
+                saldo_actual = mv
+                last_update = mts
+                real_series = pd.concat([real_series, pd.DataFrame([{"timestamp": mts, "equity": mv}])], ignore_index=True)
+                real_series = real_series.sort_values("timestamp").drop_duplicates(subset=["timestamp"], keep="last")
+            else:
+                source = "MAESTRO_HIST"
+                saldo_actual = float(real_series["equity"].iloc[-1])
+                last_update = real_series["timestamp"].iloc[-1]
+            if len(real_series) < 3:
+                warnings.append("historial real en construcción (aún pocas muestras)")
+        elif master is not None:
             mv, mts = master
             source = "MAESTRO"
             saldo_actual = mv
@@ -476,10 +553,35 @@ class DashboardWindow(QtWidgets.QMainWindow):
         plot.clear()
         if s.empty:
             return
+        if plot.legend is None:
+            plot.addLegend(offset=(10, 8))
+        else:
+            plot.legend.clear()
         x = (s["timestamp"].astype("int64") / 1e9).to_numpy(dtype=float)
         y = s["equity"].to_numpy(dtype=float)
-        plot.plot(x, y, pen=pg.mkPen(color, width=2.8))
-        plot.plot([x[-1]], [y[-1]], pen=pg.mkPen("#ffffff33"), symbol="o", symbolSize=9, symbolBrush=endpoint)
+        plot.plot(x, y, pen=pg.mkPen(color, width=3.6), name="Serie real")
+        plot.plot([x[-1]], [y[-1]], pen=pg.mkPen("#ffffff33"), symbol="o", symbolSize=11, symbolBrush=endpoint, name="Último")
+
+        imax = int(np.argmax(y))
+        imin = int(np.argmin(y))
+        plot.plot([x[imax]], [y[imax]], pen=None, symbol="t", symbolSize=11, symbolBrush="#ffd36b", name="Máximo")
+        plot.plot([x[imin]], [y[imin]], pen=None, symbol="t1", symbolSize=11, symbolBrush="#ff8f8f", name="Mínimo")
+
+        if len(y) >= 6:
+            dy = np.diff(y)
+            std = float(np.std(dy)) if len(dy) else 0.0
+            if std > 0:
+                j = int(np.argmax(np.abs(dy)))
+                if abs(float(dy[j])) >= 2.0 * std:
+                    plot.plot(
+                        [x[j + 1]],
+                        [y[j + 1]],
+                        pen=None,
+                        symbol="s",
+                        symbolSize=10,
+                        symbolBrush="#f4a4ff",
+                        name="Salto",
+                    )
 
     def refresh(self, force: bool = False):
         if self.paused and not force:

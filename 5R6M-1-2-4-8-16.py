@@ -1351,6 +1351,13 @@ SALDO_LIVE_FILE = "saldo_real_live.json"
 SALDO_LIVE_SHARED_PATH = os.path.abspath(
     os.getenv("SALDO_LIVE_SHARED_PATH", os.path.join(os.path.expanduser("~"), SALDO_LIVE_FILE))
 )
+SALDO_LIVE_HISTORY_FILE = "saldo_real_live_history.jsonl"
+SALDO_LIVE_HISTORY_SHARED_PATH = os.path.abspath(
+    os.getenv(
+        "SALDO_LIVE_HISTORY_SHARED_PATH",
+        os.path.join(os.path.dirname(SALDO_LIVE_SHARED_PATH), SALDO_LIVE_HISTORY_FILE),
+    )
+)
 meta_mostrada = False
 eventos_recentes = deque(maxlen=8)
 reinicio_forzado = asyncio.Event()
@@ -15585,6 +15592,73 @@ def _set_saldo_status(status: str, reason: str, detail: str = "", announce: bool
             SALDO_LAST_EVENT_KEY = key
             SALDO_LAST_EVENT_TS = now
             agregar_evento(msg)
+
+
+def _persistir_saldo_live():
+    """Persistencia atómica del saldo real para monitores externos."""
+    try:
+        target = SALDO_LIVE_SHARED_PATH
+        target_dir = os.path.dirname(target) or "."
+        os.makedirs(target_dir, exist_ok=True)
+        payload = {
+            "saldo_real": float(SALDO_LAST_VALID_VALUE) if SALDO_LAST_VALID_VALUE is not None else None,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "status": str(SALDO_STATUS),
+            "source": "MAESTRO_DERIV",
+            "last_valid_ts": float(SALDO_LAST_VALID_TS or 0.0),
+        }
+        tmp = f"{target}.tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False)
+        os.replace(tmp, target)
+
+        # Historial real (append robusto, sin duplicar snapshot idéntico consecutivo).
+        try:
+            hist_target = SALDO_LIVE_HISTORY_SHARED_PATH
+            hist_dir = os.path.dirname(hist_target) or "."
+            os.makedirs(hist_dir, exist_ok=True)
+            last_obj = None
+            if os.path.exists(hist_target):
+                with open(hist_target, "r", encoding="utf-8", errors="ignore") as hf:
+                    for line in hf:
+                        line = line.strip()
+                        if line:
+                            try:
+                                last_obj = json.loads(line)
+                            except Exception:
+                                pass
+            try:
+                last_saldo = float((last_obj or {}).get("saldo_real"))
+            except Exception:
+                last_saldo = None
+            curr_saldo = payload.get("saldo_real")
+            same_as_last = (
+                isinstance(last_obj, dict)
+                and last_saldo is not None
+                and curr_saldo is not None
+                and float(last_saldo) == float(curr_saldo)
+                and str(last_obj.get("status", "")) == str(payload["status"])
+                and str(last_obj.get("source", "")) == str(payload["source"])
+            )
+            if not same_as_last:
+                with open(hist_target, "a", encoding="utf-8") as hf:
+                    hf.write(json.dumps(payload, ensure_ascii=False) + "\n")
+                    hf.flush()
+                    try:
+                        os.fsync(hf.fileno())
+                    except Exception:
+                        pass
+        except Exception as e_hist:
+            try:
+                print(f"⚠️ No se pudo persistir historial saldo live ({SALDO_LIVE_HISTORY_SHARED_PATH}): {e_hist}")
+            except Exception:
+                pass
+    except Exception as e:
+        # No tumbar maestro por fallo de persistencia.
+        try:
+            print(f"⚠️ No se pudo persistir saldo live ({SALDO_LIVE_SHARED_PATH}): {e}")
+        except Exception:
+            pass
 
 
 def _persistir_saldo_live():
