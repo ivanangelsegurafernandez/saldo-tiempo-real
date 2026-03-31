@@ -69,6 +69,23 @@ def _fmt_money(v: Optional[float]) -> str:
     return f"{v:,.2f} USD"
 
 
+def _fmt_local_ts(ts_obj) -> str:
+    if ts_obj is None:
+        return "--"
+    try:
+        if isinstance(ts_obj, pd.Timestamp):
+            if ts_obj.tzinfo is None:
+                ts_obj = ts_obj.tz_localize("UTC")
+            return ts_obj.to_pydatetime().astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
+        if isinstance(ts_obj, datetime):
+            if ts_obj.tzinfo is None:
+                ts_obj = ts_obj.replace(tzinfo=timezone.utc)
+            return ts_obj.astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
+    except Exception:
+        return "--"
+    return "--"
+
+
 def _safe_float(x, default=np.nan):
     try:
         if x is None:
@@ -406,7 +423,7 @@ class DataEngine:
                 f"Estado histórico: {'OK' if hist_path_used and Path(hist_path_used).exists() else 'NO ENCONTRADO'}"
             )
             valid_rows = int(len(hist))
-            last_hist_ts = hist["timestamp"].iloc[-1].astimezone().strftime("%Y-%m-%d %H:%M:%S %Z") if valid_rows else "--"
+            last_hist_ts = _fmt_local_ts(hist["timestamp"].iloc[-1]) if valid_rows else "--"
             warnings.append(
                 f"Histórico válido: {valid_rows} muestra(s) | última marca válida: {last_hist_ts}"
             )
