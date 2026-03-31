@@ -53,6 +53,8 @@ warnings.filterwarnings(
     message="X does not have valid feature names, but StandardScaler was fitted with feature names"
 )
 
+from saldo_csv_tools import append_raw_balance_sample, refresh_aggregate_csvs
+
 
 os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")
 
@@ -1358,6 +1360,19 @@ SALDO_LIVE_HISTORY_SHARED_PATH = os.path.abspath(
         os.path.join(os.path.dirname(SALDO_LIVE_SHARED_PATH), SALDO_LIVE_HISTORY_FILE),
     )
 )
+SALDO_SERIES_CSV_FILE = "saldo_real_series.csv"
+SALDO_1MIN_CSV_FILE = "saldo_real_1min.csv"
+SALDO_1H_CSV_FILE = "saldo_real_1h.csv"
+SALDO_SERIES_CSV_PATH = os.path.abspath(
+    os.getenv("SALDO_SERIES_CSV_PATH", os.path.join(os.path.dirname(SALDO_LIVE_SHARED_PATH), SALDO_SERIES_CSV_FILE))
+)
+SALDO_1MIN_CSV_PATH = os.path.abspath(
+    os.getenv("SALDO_1MIN_CSV_PATH", os.path.join(os.path.dirname(SALDO_SERIES_CSV_PATH), SALDO_1MIN_CSV_FILE))
+)
+SALDO_1H_CSV_PATH = os.path.abspath(
+    os.getenv("SALDO_1H_CSV_PATH", os.path.join(os.path.dirname(SALDO_SERIES_CSV_PATH), SALDO_1H_CSV_FILE))
+)
+SALDO_CSV_AGG_CACHE = {}
 meta_mostrada = False
 eventos_recentes = deque(maxlen=8)
 reinicio_forzado = asyncio.Event()
@@ -15596,6 +15611,7 @@ def _set_saldo_status(status: str, reason: str, detail: str = "", announce: bool
 
 
 def _persistir_saldo_live():
+    global SALDO_CSV_AGG_CACHE
     try:
         now_utc = datetime.now(timezone.utc)
         payload = {
@@ -15658,6 +15674,29 @@ def _persistir_saldo_live():
                     os.fsync(hf.fileno())
                 except Exception:
                     pass
+            try:
+                wrote_raw, raw_msg, _ = append_raw_balance_sample(
+                    SALDO_SERIES_CSV_PATH,
+                    ts_utc=str(payload.get("timestamp")),
+                    epoch=float(now_utc.timestamp()),
+                    saldo_real=payload.get("saldo_real"),
+                    status=str(payload.get("status", "")),
+                    source=str(payload.get("source", "")),
+                    event_type=str(payload.get("event_type", "change")),
+                )
+                if wrote_raw:
+                    ok_agg, agg_msg, SALDO_CSV_AGG_CACHE = refresh_aggregate_csvs(
+                        SALDO_SERIES_CSV_PATH,
+                        SALDO_1MIN_CSV_PATH,
+                        SALDO_1H_CSV_PATH,
+                        SALDO_CSV_AGG_CACHE,
+                    )
+                    if not ok_agg and agg_msg not in ("unchanged",):
+                        print(f"⚠️ No se pudo refrescar agregados CSV de saldo: {agg_msg}")
+                elif raw_msg not in ("duplicate_last_sample_id",):
+                    print(f"⚠️ No se pudo escribir CSV crudo de saldo: {raw_msg}")
+            except Exception as e:
+                print(f"⚠️ Error al persistir CSV de saldo: {e}")
     except Exception as e:
         try:
             print(f"⚠️ No se pudo persistir saldo live/hist: {e}")
