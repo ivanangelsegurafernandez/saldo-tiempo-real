@@ -1400,6 +1400,7 @@ last_update_time = {bot: time.time() for bot in BOT_NAMES}
 LAST_REAL_CLOSE_SIG = {bot: None for bot in BOT_NAMES}  # evita procesar el mismo cierre REAL varias veces
 CTT_CLOSE_EVENTS = deque(maxlen=6000)
 CTT_CLOSE_SEEN = set()
+HUD_CLOSE_LOG_TS = {}
 CTT_STATE = {
     "status": "NEUTRAL",
     "regime": "NEUTRAL",
@@ -3168,6 +3169,53 @@ def normalizar_trade_status(ts):
         return s
     except Exception:
         return ""
+
+
+def _resultado_cierre_desde_fila(fila_dict: dict) -> str:
+    """Obtiene resultado canónico de una fila cerrada sin depender de una sola columna."""
+    try:
+        res = normalizar_resultado((fila_dict or {}).get("resultado", ""))
+        if res in ("GANANCIA", "PÉRDIDA"):
+            return res
+
+        for k in ("result_bin", "resultado_bin", "y", "label", "result"):
+            v = (fila_dict or {}).get(k, None)
+            if v in (None, "", "nan", "NaN"):
+                continue
+            try:
+                iv = int(float(v))
+                if iv == 1:
+                    return "GANANCIA"
+                if iv == 0:
+                    return "PÉRDIDA"
+            except Exception:
+                continue
+
+        gp = (fila_dict or {}).get("ganancia_perdida", None)
+        if gp not in (None, "", "nan", "NaN"):
+            try:
+                fv = float(gp)
+                if fv > 0:
+                    return "GANANCIA"
+                if fv < 0:
+                    return "PÉRDIDA"
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return "INDEFINIDO"
+
+
+def _hud_log_once(bot: str, key: str, msg: str, cooldown_s: float = 20.0):
+    try:
+        now = float(time.time())
+        map_key = f"{bot}|{key}"
+        last = float(HUD_CLOSE_LOG_TS.get(map_key, 0.0) or 0.0)
+        if (now - last) >= float(max(1.0, cooldown_s)):
+            HUD_CLOSE_LOG_TS[map_key] = now
+            agregar_evento(msg)
+    except Exception:
+        pass
 
 def canonicalizar_campos_bot_maestro(row_dict: dict | None):
     """
@@ -15399,8 +15447,11 @@ async def cargar_datos_bot(bot, token_actual):
             except Exception:
                 pass
 
-            trade_status = str(fila_dict.get("trade_status", "")).strip().upper()
-            resultado = normalizar_resultado(fila_dict.get("resultado", ""))
+            trade_status = normalizar_trade_status(
+                fila_dict.get("trade_status_norm", None) or fila_dict.get("trade_status", None)
+            )
+            resultado = _resultado_cierre_desde_fila(fila_dict)
+            cierre_valido_hud = (trade_status == "CERRADO" and resultado in ("GANANCIA", "PÉRDIDA"))
 
             try:
                 ep_dec = int(float(fila_dict.get("epoch", 0) or 0))
@@ -15417,7 +15468,21 @@ async def cargar_datos_bot(bot, token_actual):
             #    - Calculamos Prob IA para el HUD
             #    - NO tocamos historial, n, ni %éxito (evita los “·” intercalados)
             # =========================
-            if resultado not in ("GANANCIA", "PÉRDIDA"):
+            if not cierre_valido_hud:
+                if trade_status == "CERRADO":
+                    if estado_bots[bot].get("ia_senal_pendiente"):
+                        estado_bots[bot]["ia_senal_pendiente"] = False
+                        estado_bots[bot]["ia_prob_senal"] = None
+                    _hud_log_once(
+                        bot,
+                        "close_reject",
+                        f"[HUD REJECT] {bot} cierre descartado: resultado inválido ({fila_dict.get('resultado', '')})",
+                        cooldown_s=25.0,
+                    )
+                    estado_bots[bot]["token"] = "REAL" if effective_owner == bot else "DEMO"
+                    last_update_time[bot] = time.time()
+                    continue
+
                 # Guarda epoch PRE más reciente para heartbeat ACK (sin depender de filas nuevas constantes)
                 try:
                     ep_pre = fila_dict.get("epoch", 0)
@@ -15429,15 +15494,6 @@ async def cargar_datos_bot(bot, token_actual):
 
                 # Si el bot marcó CERRADO pero no trajo resultado válido,
                 # cerramos señal pendiente (si existía) sin contaminar historial.
-                if trade_status == "CERRADO":
-                    if estado_bots[bot].get("ia_senal_pendiente"):
-                        estado_bots[bot]["ia_senal_pendiente"] = False
-                        estado_bots[bot]["ia_prob_senal"] = None
-
-                    estado_bots[bot]["token"] = "REAL" if effective_owner == bot else "DEMO"
-                    last_update_time[bot] = time.time()
-                    continue
-
                 missing = [col for col in required_cols if pd.isna(fila_dict.get(col))]
                 if missing:
                     agregar_evento(f"⚠️ {bot}: PRE_TRADE incompleto, faltan {len(missing)} cols: {missing[:5]}")
@@ -15498,9 +15554,22 @@ async def cargar_datos_bot(bot, token_actual):
             #    - Aquí sí actualizamos historial y estadísticas reales
             # =========================
             _registrar_cierre_ctt(bot, fila_dict, resultado)
+            if not str(fila_dict.get("ia_decision_id", "") or "").strip():
+                _hud_log_once(
+                    bot,
+                    "close_orphan_fallback",
+                    f"[HUD FALLBACK] {bot} cierre huérfano aceptado para tabla",
+                    cooldown_s=20.0,
+                )
             estado_bots[bot]["ultimo_resultado"] = resultado
             estado_bots[bot]["resultados"].append(resultado)
             estado_bots[bot]["tamano_muestra"] += 1
+            _hud_log_once(
+                bot,
+                "close_ok",
+                f"[HUD CLOSE] {bot} -> {resultado} | n={int(estado_bots[bot]['tamano_muestra'])}",
+                cooldown_s=8.0,
+            )
 
             if resultado == "GANANCIA":
                 estado_bots[bot]["ganancias"] += 1
