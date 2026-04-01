@@ -1353,6 +1353,7 @@ SALDO_LAST_EVENT_KEY = ""
 SALDO_LAST_EVENT_TS = 0.0
 SALDO_LIVE_FILE = "saldo_real_live.json"
 SALDO_LIVE_HISTORY_FILE = "saldo_real_live_history.jsonl"
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 SALDO_LIVE_SHARED_PATH = os.path.abspath(
     os.getenv("SALDO_LIVE_SHARED_PATH", os.path.join(os.path.expanduser("~"), SALDO_LIVE_FILE))
 )
@@ -1363,9 +1364,17 @@ SALDO_LIVE_HISTORY_SHARED_PATH = os.path.abspath(
     )
 )
 SALDO_SERIES_CSV_FILE = "saldo_real_series.csv"
-SALDO_SERIES_CSV_PATH = os.path.abspath(
-    os.getenv("SALDO_SERIES_CSV_PATH", os.path.join(os.path.dirname(SALDO_LIVE_SHARED_PATH), SALDO_SERIES_CSV_FILE))
-)
+def resolver_ruta_saldo_series() -> str:
+    custom = os.getenv("SALDO_SERIES_CSV_PATH", "").strip()
+    if custom:
+        return os.path.abspath(os.path.expanduser(custom))
+    return os.path.abspath(os.path.join(SCRIPT_DIR, SALDO_SERIES_CSV_FILE))
+
+SALDO_SERIES_CSV_PATH = resolver_ruta_saldo_series()
+SALDO_CSV_LOG_LAST_TS = 0.0
+print(f"[SALDO LIVE] destino: {SALDO_LIVE_SHARED_PATH}")
+print(f"[SALDO HIST] destino: {SALDO_LIVE_HISTORY_SHARED_PATH}")
+print(f"[SALDO CSV] destino: {SALDO_SERIES_CSV_PATH}")
 def _safe_saldo_display_tz():
     if ZoneInfo is None:
         return timezone.utc
@@ -15682,6 +15691,7 @@ def _set_saldo_status(status: str, reason: str, detail: str = "", announce: bool
 
 
 def _persistir_saldo_series_csv(payload: dict, now_utc: datetime, event_type: str):
+    global SALDO_CSV_LOG_LAST_TS
     csv_path = SALDO_SERIES_CSV_PATH
     os.makedirs(os.path.dirname(csv_path) or ".", exist_ok=True)
     cols = ["ts_utc", "ts_lima", "epoch", "saldo_real", "status", "source", "event_type"]
@@ -15744,8 +15754,22 @@ def _persistir_saldo_series_csv(payload: dict, now_utc: datetime, event_type: st
                 os.fsync(f.fileno())
             except Exception:
                 pass
-    except Exception:
-        pass
+        now_log = float(time.time())
+        if (now_log - float(SALDO_CSV_LOG_LAST_TS or 0.0)) >= 12.0:
+            SALDO_CSV_LOG_LAST_TS = now_log
+            try:
+                print(
+                    f"[SALDO CSV] append ok -> {os.path.basename(csv_path)} | "
+                    f"saldo={saldo_val:.2f} | event={event_type}"
+                )
+            except Exception:
+                pass
+    except Exception as e:
+        print(f"[SALDO CSV][ERROR] append failed en {csv_path}: {e}")
+        try:
+            traceback.print_exc(limit=1)
+        except Exception:
+            pass
 
 
 def _persistir_saldo_live():

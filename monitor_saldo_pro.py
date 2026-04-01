@@ -8,8 +8,9 @@ Dependencias:
 Lectura de datos (prioridad REAL):
 1) saldo_real_live_history.jsonl (ruta compartida)
 2) saldo_real_live.json (snapshot maestro)
-3) LOG_SALDOS / *.log / *.txt (observado)
-4) registro_enriquecido_fulll*.csv (auxiliar)
+3) saldo_real_series.csv (fallback real)
+4) LOG_SALDOS / *.log / *.txt (observado)
+5) registro_enriquecido_fulll*.csv (auxiliar)
 """
 
 from __future__ import annotations
@@ -24,12 +25,31 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
-from zoneinfo import ZoneInfo
+try:
+    from zoneinfo import ZoneInfo
+except Exception:
+    ZoneInfo = None
 
-import numpy as np
-import pandas as pd
-import pyqtgraph as pg
-from PySide6 import QtCore, QtGui, QtWidgets
+try:
+    import numpy as np
+except Exception as e:
+    print(f"[MONITOR][ERROR] Dependencia faltante o inválida: numpy ({e})")
+    raise
+try:
+    import pandas as pd
+except Exception as e:
+    print(f"[MONITOR][ERROR] Dependencia faltante o inválida: pandas ({e})")
+    raise
+try:
+    import pyqtgraph as pg
+except Exception as e:
+    print(f"[MONITOR][ERROR] Dependencia faltante o inválida: pyqtgraph ({e})")
+    raise
+try:
+    from PySide6 import QtCore, QtGui, QtWidgets
+except Exception as e:
+    print(f"[MONITOR][ERROR] Dependencia faltante o inválida: PySide6 ({e})")
+    raise
 
 # ------------------------ Config ------------------------
 CUENTA_OBJETIVO = "REAL"  # REAL | DEMO | ALL
@@ -45,6 +65,7 @@ SALDO_LIVE_FILE = "saldo_real_live.json"
 SALDO_LIVE_HISTORY_FILE = "saldo_real_live_history.jsonl"
 SALDO_SERIES_CSV_FILE = "saldo_real_series.csv"
 DISPLAY_TIMEZONE = "America/Lima"
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 SALDO_LIVE_SHARED_PATH = os.path.abspath(
     os.getenv("SALDO_LIVE_SHARED_PATH", os.path.join(os.path.expanduser("~"), SALDO_LIVE_FILE))
 )
@@ -54,6 +75,13 @@ SALDO_LIVE_HISTORY_SHARED_PATH = os.path.abspath(
         os.path.join(os.path.dirname(SALDO_LIVE_SHARED_PATH), SALDO_LIVE_HISTORY_FILE),
     )
 )
+def resolver_ruta_saldo_series() -> str:
+    custom = os.getenv("SALDO_SERIES_CSV_PATH", "").strip()
+    if custom:
+        return os.path.abspath(os.path.expanduser(custom))
+    return os.path.abspath(os.path.join(SCRIPT_DIR, SALDO_SERIES_CSV_FILE))
+
+SALDO_SERIES_CSV_PATH = resolver_ruta_saldo_series()
 SALDO_LIVE_PATH = os.getenv("SALDO_LIVE_PATH", "").strip()
 
 MONITOR_VERSION = "v2026.03.31-r1"
@@ -61,13 +89,22 @@ MONITOR_BUILD_ID = "MONITOR_SALDO_PRO_REAL_SERIES_GUARD"
 MIN_POINTS_FOR_LINE = 2
 SHOW_LAST_MARKER = True
 SHOW_EXTREME_MARKERS = False
-Y_SCALE_MODE = os.getenv("Y_SCALE_MODE", "auto").strip().lower()  # capital | manual | auto
+Y_SCALE_MODE = os.getenv("Y_SCALE_MODE", "capital").strip().lower()  # capital | manual | auto
 Y_AXIS_MIN_USD = float(os.getenv("Y_AXIS_MIN_USD", "0"))
 Y_AXIS_MAX_USD = float(os.getenv("Y_AXIS_MAX_USD", "300"))
 Y_AUTO_SPAN_USD = float(os.getenv("Y_AUTO_SPAN_USD", "120"))
 CAPITAL_BASE_USD = float(os.getenv("CAPITAL_BASE_USD", "0") or "0")
 MIN_X_SPAN_SECONDS = 20.0
-DISPLAY_TZ = ZoneInfo(DISPLAY_TIMEZONE)
+def _safe_display_tz():
+    if ZoneInfo is None:
+        return timezone.utc
+    try:
+        return ZoneInfo(DISPLAY_TIMEZONE)
+    except Exception:
+        return timezone.utc
+
+
+DISPLAY_TZ = _safe_display_tz()
 
 
 
@@ -215,6 +252,7 @@ class DataEngine:
         self.base_dir = base_dir
         self._cache: Dict[str, Tuple[Tuple, object]] = {}
         self._history_last_seen: Optional[Tuple[str, int, int]] = None
+        self._agg_cache_state: Dict[str, object] = {}
 
     @staticmethod
     def _sig(paths: List[Path]) -> Tuple:
@@ -232,8 +270,6 @@ class DataEngine:
         if SALDO_LIVE_PATH:
             custom = Path(SALDO_LIVE_PATH).expanduser()
             cands.append(custom / SALDO_LIVE_FILE if custom.is_dir() else custom)
-        cands.append(self.base_dir / SALDO_LIVE_FILE)
-        cands.append(Path.cwd() / SALDO_LIVE_FILE)
         out: List[Path] = []
         seen = set()
         for p in cands:
@@ -247,6 +283,19 @@ class DataEngine:
         cands: List[Path] = [Path(SALDO_LIVE_HISTORY_SHARED_PATH).expanduser()]
         for p in self._master_live_candidates():
             cands.append(p.parent / SALDO_LIVE_HISTORY_FILE)
+        out: List[Path] = []
+        seen = set()
+        for p in cands:
+            k = str(p)
+            if k not in seen:
+                seen.add(k)
+                out.append(p)
+        return out
+
+    def _master_series_candidates(self) -> List[Path]:
+        cands: List[Path] = [Path(SALDO_SERIES_CSV_PATH).expanduser()]
+        for p in self._master_live_candidates():
+            cands.append(p.parent / SALDO_SERIES_CSV_FILE)
         out: List[Path] = []
         seen = set()
         for p in cands:
@@ -336,6 +385,34 @@ class DataEngine:
             sig,
             (pd.DataFrame(columns=["timestamp", "equity"]), f"Sin histórico real: no se encontró {SALDO_LIVE_HISTORY_FILE} en ruta compartida: {SALDO_LIVE_HISTORY_SHARED_PATH}", None, None),
         )
+
+    def _read_saldo_series_csv(self) -> Tuple[pd.DataFrame, Optional[str], Optional[Path]]:
+        paths = self._master_series_candidates()
+        sig = self._sig(paths)
+        cached = self._cached("series_csv", sig)
+        if cached is not None:
+            return cached
+        for p in paths:
+            if not p.exists():
+                continue
+            try:
+                rows = []
+                with p.open("r", encoding="utf-8", errors="ignore", newline="") as fh:
+                    reader = pd.read_csv(fh)
+                if "saldo_real" not in reader.columns:
+                    continue
+                ts = pd.to_datetime(reader.get("ts_utc"), errors="coerce", utc=True)
+                if ts.isna().all() and "epoch" in reader.columns:
+                    ts = pd.to_datetime(pd.to_numeric(reader["epoch"], errors="coerce"), unit="s", errors="coerce", utc=True)
+                vals = pd.to_numeric(reader["saldo_real"], errors="coerce")
+                d = pd.DataFrame({"timestamp": ts, "equity": vals}).dropna(subset=["timestamp", "equity"])
+                if d.empty:
+                    continue
+                d = d.sort_values("timestamp").drop_duplicates(subset=["timestamp", "equity"], keep="last")
+                return self._store_cache("series_csv", sig, (d, None, p))
+            except Exception:
+                return self._store_cache("series_csv", sig, (pd.DataFrame(columns=["timestamp", "equity"]), f"{SALDO_SERIES_CSV_FILE} inválido", p))
+        return self._store_cache("series_csv", sig, (pd.DataFrame(columns=["timestamp", "equity"]), None, None))
 
     def _check_history_growth(self, path: Path, valid_rows: int) -> Optional[str]:
         try:
@@ -464,6 +541,7 @@ class DataEngine:
 
         master, master_msg, live_path_used = self._read_master_live() if view == "REAL" else (None, None, None)
         hist, hist_msg, hist_path_used, hist_growth_msg = self._read_master_history() if view == "REAL" else (pd.DataFrame(columns=["timestamp", "equity"]), None, None, None)
+        series_csv, series_msg, series_path_used = self._read_saldo_series_csv() if view == "REAL" else (pd.DataFrame(columns=["timestamp", "equity"]), None, None)
         observed = self._parse_observed(view)
         estimated = self._build_estimated(view)
 
@@ -473,9 +551,22 @@ class DataEngine:
             warnings.append(hist_msg)
 
         if view == "REAL":
+            warnings.append(f"Monitor {MONITOR_VERSION} · id={MONITOR_BUILD_ID}")
+            warnings.append(f"Ruta snapshot real: {live_path_used if live_path_used else SALDO_LIVE_SHARED_PATH}")
+            warnings.append(f"Ruta histórico real: {hist_path_used if hist_path_used else SALDO_LIVE_HISTORY_SHARED_PATH}")
+            if series_msg:
+                warnings.append(series_msg)
+            if series_path_used:
+                warnings.append(f"Ruta serie CSV real: {series_path_used}")
+            warnings.append(
+                f"Estado snapshot: {'OK' if live_path_used and Path(live_path_used).exists() else 'NO ENCONTRADO'} | "
+                f"Estado histórico: {'OK' if hist_path_used and Path(hist_path_used).exists() else 'NO ENCONTRADO'}"
+            )
             valid_rows = int(len(hist))
             last_hist_ts = _fmt_local_ts(hist["timestamp"].iloc[-1]) if valid_rows else "--"
-            warnings.append(f"Muestras: {valid_rows} | última: {last_hist_ts}")
+            warnings.append(
+                f"Histórico válido: {valid_rows} muestra(s) | última marca válida: {last_hist_ts}"
+            )
             if hist_growth_msg:
                 warnings.append(hist_growth_msg)
 
@@ -502,6 +593,11 @@ class DataEngine:
             saldo_actual = mv
             last_update = mts
             real_series = pd.DataFrame([{"timestamp": mts, "equity": mv}])
+        elif view == "REAL" and not series_csv.empty:
+            source = "SERIE_CSV"
+            saldo_actual = float(series_csv["equity"].iloc[-1])
+            last_update = series_csv["timestamp"].iloc[-1]
+            real_series = series_csv
         elif not observed.empty:
             source = "OBSERVADO"
             saldo_actual = float(observed["equity"].iloc[-1])
@@ -656,14 +752,13 @@ class DashboardWindow(QtWidgets.QMainWindow):
     def _style_plot(self, plot: pg.PlotItem, title: str):
         plot.setTitle(f"<span style='color:#cfe2ff;font-size:12pt;font-weight:680'>{title}</span>")
         plot.setLabel("left", "USD")
-        plot.showGrid(x=True, y=True, alpha=0.18)
+        plot.showGrid(x=True, y=True, alpha=0.05)
         for ax in (plot.getAxis("left"), plot.getAxis("bottom")):
             ax.setTextPen(pg.mkPen("#b9d0ee")); ax.setPen(pg.mkPen("#35506f"))
         plot.addLegend(offset=(5, 5), labelTextSize="7pt")
-        if Y_SCALE_MODE == "manual":
-            y0, y1, _ = self._resolve_y_range(None)
-            plot.setYRange(y0, y1, padding=0.0)
-            plot.setLimits(yMin=y0, yMax=y1)
+        y0, y1, _ = self._resolve_y_range(None)
+        plot.setYRange(y0, y1, padding=0.0)
+        plot.setLimits(yMin=y0, yMax=y1)
 
     def _resolve_y_range(self, y: Optional[np.ndarray]) -> Tuple[float, float, str]:
         if Y_SCALE_MODE == "manual":
@@ -686,19 +781,14 @@ class DashboardWindow(QtWidgets.QMainWindow):
             y0 = max(0.0, base - band * 0.5)
             y1 = y0 + band
             return y0, y1, f"capital · base={base:,.2f} span={band:,.2f}"
-        # auto: ajustar al rango real de datos con padding (estilo gráfico bursátil)
         if y is None or len(y) == 0:
             span = float(max(10.0, Y_AUTO_SPAN_USD))
-            return 0.0, span, f"auto · sin datos"
-        ymin = float(np.nanmin(y))
-        ymax = float(np.nanmax(y))
-        spread = ymax - ymin
-        if spread < 1.0:
-            spread = max(10.0, ymax * 0.10)
-        padding = spread * 0.12
-        y0 = max(0.0, ymin - padding)
-        y1 = ymax + padding
-        return y0, y1, f"auto · {y0:,.2f}–{y1:,.2f}"
+            return 0.0, span, f"auto · span={span:,.2f}"
+        center = float(np.nanmedian(y))
+        span = float(max(10.0, Y_AUTO_SPAN_USD))
+        y0 = max(0.0, center - span * 0.5)
+        y1 = y0 + span
+        return y0, y1, f"auto · span={span:,.2f}"
 
     def _init_plot_state(self, plot: pg.PlotItem, color: str, endpoint: str, canonical_window_s: int) -> Dict[str, object]:
         glow = plot.plot([], [], pen=pg.mkPen(color + "55", width=8.0), name=None)
@@ -706,13 +796,9 @@ class DashboardWindow(QtWidgets.QMainWindow):
         last = plot.plot([], [], pen=None, symbol="o", symbolSize=5, symbolBrush=endpoint, name=None)
         vmax = plot.plot([], [], pen=None, symbol="o", symbolSize=4, symbolBrush="#ffd36b99", name=None)
         vmin = plot.plot([], [], pen=None, symbol="o", symbolSize=4, symbolBrush="#ff8f8f99", name=None)
-        txt = pg.TextItem(text="", color="#f0c040", anchor=(0, 0.5), fill=pg.mkBrush("#1a2a3a99"))
-        txt.setFont(QtGui.QFont("Consolas", 9, QtGui.QFont.Bold))
-        hline = pg.InfiniteLine(angle=0, pen=pg.mkPen("#f0c04055", width=1.0, style=QtCore.Qt.DashLine))
-        hline.setVisible(False)
-        plot.addItem(hline)
+        txt = pg.TextItem(text="", color="#9ec2ff", anchor=(0, 1))
         plot.addItem(txt)
-        return {"plot": plot, "glow": glow, "line": line, "last": last, "max": vmax, "min": vmin, "text": txt, "hline": hline, "canonical_window_s": int(canonical_window_s)}
+        return {"plot": plot, "glow": glow, "line": line, "last": last, "max": vmax, "min": vmin, "text": txt, "canonical_window_s": int(canonical_window_s)}
 
     def _set_x_range_visible(self, plot: pg.PlotItem, x: np.ndarray, canonical_window_s: int):
         if len(x) == 0:
@@ -757,7 +843,7 @@ class DashboardWindow(QtWidgets.QMainWindow):
 
     def _update_plot_state(self, state: Dict[str, object], s: pd.DataFrame) -> str:
         plot = state["plot"]
-        glow = state["glow"]; line = state["line"]; last = state["last"]; vmax = state["max"]; vmin = state["min"]; txt = state["text"]; hline = state["hline"]
+        glow = state["glow"]; line = state["line"]; last = state["last"]; vmax = state["max"]; vmin = state["min"]; txt = state["text"]
         s = _sanitize_series_for_plot(s)
         if s.empty:
             glow.setData([], [])
@@ -766,7 +852,6 @@ class DashboardWindow(QtWidgets.QMainWindow):
             vmax.setData([], [])
             vmin.setData([], [])
             txt.setText("Sin puntos")
-            hline.setVisible(False)
             return "sin datos"
 
         x = (s["timestamp"].astype("int64") / 1e9).to_numpy(dtype=float)
@@ -775,17 +860,11 @@ class DashboardWindow(QtWidgets.QMainWindow):
         if len(x) >= MIN_POINTS_FOR_LINE:
             glow.setData(x, y)
             line.setData(x, y)
-            # Valor actual en último punto (estilo gráfico bursátil)
-            last_val = y[-1]
-            txt.setText(f" {last_val:,.2f} ", color="#f0c040")
-            txt.setPos(x[-1], y[-1])
-            hline.setValue(y[-1])
-            hline.setVisible(True)
+            txt.setText("")
         else:
             glow.setData([], [])
             line.setData([], [])
             txt.setText("1 punto: esperando más histórico")
-            hline.setVisible(False)
 
         marker_size = 8 if len(x) == 1 else 4
         if SHOW_LAST_MARKER:
@@ -800,7 +879,6 @@ class DashboardWindow(QtWidgets.QMainWindow):
             vmax.setData([], [])
             vmin.setData([], [])
         y0, y1, scale_info = self._resolve_y_range(y)
-        plot.setLimits(yMin=y0 - (y1 - y0) * 0.5, yMax=y1 + (y1 - y0) * 0.5)
         plot.setYRange(y0, y1, padding=0.0)
         self._set_x_range_visible(plot, x, int(state["canonical_window_s"]))
         return scale_info
@@ -825,7 +903,7 @@ class DashboardWindow(QtWidgets.QMainWindow):
             self.lbl_source.setText(f"FUENTE: {src}")
             if src == "MAESTRO":
                 self.lbl_source.setObjectName("BadgeMaster"); self.lbl_big.setStyleSheet("color:#72f8b1;")
-            elif src in ("OBSERVADO", "MAESTRO_HIST"):
+            elif src in ("OBSERVADO", "MAESTRO_HIST", "SERIE_CSV"):
                 self.lbl_source.setObjectName("BadgeObserved"); self.lbl_big.setStyleSheet("color:#67efff;")
             elif src == "LIVE":
                 self.lbl_source.setObjectName("BadgeLive"); self.lbl_big.setStyleSheet("color:#9ef7d8;")
@@ -837,10 +915,19 @@ class DashboardWindow(QtWidgets.QMainWindow):
                 self.lbl_source.setObjectName("BadgeNeutral"); self.lbl_big.setStyleSheet("color:#d8e7ff;")
             self.lbl_source.style().unpolish(self.lbl_source); self.lbl_source.style().polish(self.lbl_source)
 
-            main_scale = self._update_plot_state(self.plot_states["main"], snap.series_main)
-            self._update_plot_state(self.plot_states["min"], snap.series_minutes)
-            self._update_plot_state(self.plot_states["hour"], snap.series_hours)
-            self._update_plot_state(self.plot_states["day"], snap.series_days)
+            main_scale = "--"
+            for key, series in (
+                ("main", snap.series_main),
+                ("min", snap.series_minutes),
+                ("hour", snap.series_hours),
+                ("day", snap.series_days),
+            ):
+                try:
+                    scale_info = self._update_plot_state(self.plot_states[key], series)
+                    if key == "main":
+                        main_scale = scale_info
+                except Exception as plot_err:
+                    snap.warnings.append(f"plot {key} con error: {plot_err}")
             self.lbl_scale.setText(f"ESCALA Y: {main_scale}")
             visible = _sanitize_series_for_plot(snap.series_main)
             n_visible = int(len(visible))
@@ -868,11 +955,16 @@ class DashboardWindow(QtWidgets.QMainWindow):
 
 def main():
     print(f"[MONITOR] Monitor Saldo Real Deriv {MONITOR_VERSION} · build={MONITOR_BUILD_ID}")
-    app = QtWidgets.QApplication(sys.argv)
-    w = DashboardWindow(DataEngine(Path(__file__).resolve().parent))
-    w.show()
-    sys.exit(app.exec())
+    try:
+        app = QtWidgets.QApplication(sys.argv)
+        w = DashboardWindow(DataEngine(Path(__file__).resolve().parent))
+        w.show()
+        return int(app.exec())
+    except Exception:
+        print("[MONITOR][ERROR] Falló el arranque del monitor.")
+        traceback.print_exc()
+        return 1
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
