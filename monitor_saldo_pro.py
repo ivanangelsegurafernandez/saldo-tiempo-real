@@ -16,6 +16,7 @@ Lectura de datos (prioridad REAL):
 from __future__ import annotations
 
 import glob
+import io
 import json
 import os
 import re
@@ -110,6 +111,9 @@ RULE_STALE_S = 90.0
 RULE_VOL_HIGH_THR = 1.25
 RULE_NARROW_RANGE_USD = 1.0
 RULE_ALERT_COOLDOWN_S = 25.0
+OBSERVED_MAX_BYTES = 180_000
+ESTIMATED_REFRESH_S = 60.0
+AUX_REFRESH_EVERY_N = 12
 def _safe_display_tz():
     if ZoneInfo is None:
         return timezone.utc
@@ -288,6 +292,11 @@ class DataEngine:
         self._cache: Dict[str, Tuple[Tuple, object]] = {}
         self._history_last_seen: Optional[Tuple[str, int, int]] = None
         self._agg_cache_state: Dict[str, object] = {}
+        self._history_inc: Dict[str, object] = {"path": None, "offset": 0, "df": pd.DataFrame(columns=["timestamp", "equity"])}
+        self._series_inc: Dict[str, object] = {"path": None, "offset": 0, "df": pd.DataFrame(columns=["timestamp", "equity"])}
+        self._estimated_last_ts: float = 0.0
+        self._estimated_last_view: str = ""
+        self._tick_counter: int = 0
 
     @staticmethod
     def _sig(paths: List[Path]) -> Tuple:
@@ -393,22 +402,45 @@ class DataEngine:
                 continue
             try:
                 rows = []
-                with p.open("r", encoding="utf-8", errors="ignore") as fh:
-                    for line in fh:
-                        line = line.strip()
-                        if not line:
-                            continue
-                        obj = json.loads(line)
-                        v = _safe_float(obj.get("saldo_real"), default=np.nan)
-                        if not np.isfinite(v):
-                            continue
-                        ts = pd.to_datetime(obj.get("timestamp"), errors="coerce", utc=True)
-                        if pd.isna(ts):
-                            continue
-                        rows.append((ts.to_pydatetime(), float(v)))
-                if rows:
-                    d = pd.DataFrame(rows, columns=["timestamp", "equity"]).sort_values("timestamp")
-                    d = d.drop_duplicates(subset=["timestamp", "equity"], keep="last")
+                st = p.stat()
+                inc = self._history_inc
+                use_inc = str(inc.get("path")) == str(p) and int(inc.get("offset", 0) or 0) <= int(st.st_size)
+                if use_inc and int(inc.get("offset", 0) or 0) > 0:
+                    with p.open("r", encoding="utf-8", errors="ignore") as fh:
+                        fh.seek(int(inc.get("offset", 0) or 0))
+                        for line in fh:
+                            line = line.strip()
+                            if not line:
+                                continue
+                            obj = json.loads(line)
+                            v = _safe_float(obj.get("saldo_real"), default=np.nan)
+                            if not np.isfinite(v):
+                                continue
+                            ts = pd.to_datetime(obj.get("timestamp"), errors="coerce", utc=True)
+                            if pd.isna(ts):
+                                continue
+                            rows.append((ts.to_pydatetime(), float(v)))
+                    base_df = inc.get("df", pd.DataFrame(columns=["timestamp", "equity"]))
+                    add_df = pd.DataFrame(rows, columns=["timestamp", "equity"]) if rows else pd.DataFrame(columns=["timestamp", "equity"])
+                    d = pd.concat([base_df, add_df], ignore_index=True)
+                else:
+                    with p.open("r", encoding="utf-8", errors="ignore") as fh:
+                        for line in fh:
+                            line = line.strip()
+                            if not line:
+                                continue
+                            obj = json.loads(line)
+                            v = _safe_float(obj.get("saldo_real"), default=np.nan)
+                            if not np.isfinite(v):
+                                continue
+                            ts = pd.to_datetime(obj.get("timestamp"), errors="coerce", utc=True)
+                            if pd.isna(ts):
+                                continue
+                            rows.append((ts.to_pydatetime(), float(v)))
+                    d = pd.DataFrame(rows, columns=["timestamp", "equity"]) if rows else pd.DataFrame(columns=["timestamp", "equity"])
+                if not d.empty:
+                    d = d.sort_values("timestamp").drop_duplicates(subset=["timestamp", "equity"], keep="last")
+                    self._history_inc = {"path": str(p), "offset": int(st.st_size), "df": d}
                     growth_msg = self._check_history_growth(p, len(d))
                     return self._store_cache("hist", sig, (d, None, p, growth_msg))
             except Exception:
@@ -431,9 +463,23 @@ class DataEngine:
             if not p.exists():
                 continue
             try:
-                rows = []
-                with p.open("r", encoding="utf-8", errors="ignore", newline="") as fh:
-                    reader = pd.read_csv(fh)
+                st = p.stat()
+                inc = self._series_inc
+                use_inc = str(inc.get("path")) == str(p) and int(inc.get("offset", 0) or 0) <= int(st.st_size)
+                if use_inc and int(inc.get("offset", 0) or 0) > 0:
+                    with p.open("r", encoding="utf-8", errors="ignore", newline="") as fh:
+                        fh.seek(int(inc.get("offset", 0) or 0))
+                        chunk = fh.read()
+                    if not chunk.strip():
+                        d = inc.get("df", pd.DataFrame(columns=["timestamp", "equity"]))
+                        return self._store_cache("series_csv", sig, (d, None, p))
+                    header = "ts_utc,ts_lima,epoch,saldo_real,status,source,event_type\n"
+                    reader = pd.read_csv(io.StringIO(header + chunk))
+                    base_df = inc.get("df", pd.DataFrame(columns=["timestamp", "equity"]))
+                else:
+                    with p.open("r", encoding="utf-8", errors="ignore", newline="") as fh:
+                        reader = pd.read_csv(fh)
+                    base_df = pd.DataFrame(columns=["timestamp", "equity"])
                 if "saldo_real" not in reader.columns:
                     continue
                 ts = pd.to_datetime(reader.get("ts_utc"), errors="coerce", utc=True)
@@ -441,9 +487,11 @@ class DataEngine:
                     ts = pd.to_datetime(pd.to_numeric(reader["epoch"], errors="coerce"), unit="s", errors="coerce", utc=True)
                 vals = pd.to_numeric(reader["saldo_real"], errors="coerce")
                 d = pd.DataFrame({"timestamp": ts, "equity": vals}).dropna(subset=["timestamp", "equity"])
+                d = pd.concat([base_df, d], ignore_index=True)
                 if d.empty:
                     continue
                 d = d.sort_values("timestamp").drop_duplicates(subset=["timestamp", "equity"], keep="last")
+                self._series_inc = {"path": str(p), "offset": int(st.st_size), "df": d}
                 return self._store_cache("series_csv", sig, (d, None, p))
             except Exception:
                 return self._store_cache("series_csv", sig, (pd.DataFrame(columns=["timestamp", "equity"]), f"{SALDO_SERIES_CSV_FILE} inválido", p))
@@ -503,7 +551,12 @@ class DataEngine:
             if not p.exists() or not p.is_file():
                 continue
             try:
-                lines = p.read_text(encoding="utf-8", errors="ignore").splitlines()
+                with p.open("rb") as fh:
+                    fh.seek(0, os.SEEK_END)
+                    sz = fh.tell()
+                    fh.seek(max(0, sz - OBSERVED_MAX_BYTES), os.SEEK_SET)
+                    raw = fh.read().decode("utf-8", errors="ignore")
+                lines = raw.splitlines()[-3000:]
             except Exception:
                 continue
             base = datetime.fromtimestamp(p.stat().st_mtime, tz=timezone.utc) - timedelta(seconds=len(lines))
@@ -532,6 +585,15 @@ class DataEngine:
         files = [Path(p) for p in sorted(glob.glob(str(self.base_dir / CSV_PATTERN)))]
         sig = self._sig(files)
         key = f"est:{view}"
+        now = time.time()
+        if (
+            self._estimated_last_view == view
+            and (now - float(self._estimated_last_ts or 0.0)) < ESTIMATED_REFRESH_S
+            and key in self._cache
+        ):
+            old = self._cache.get(key)
+            if old is not None:
+                return old[1]
         cached = self._cached(key, sig)
         if cached is not None:
             return cached
@@ -568,17 +630,26 @@ class DataEngine:
         pnl = pd.to_numeric(d["ganancia_perdida"], errors="coerce").fillna(0.0)
         base = 1000.0 if view == "REAL" else (10000.0 if view == "DEMO" else 11000.0)
         d["equity"] = base + pnl.cumsum()
+        self._estimated_last_ts = now
+        self._estimated_last_view = view
         return self._store_cache(key, sig, d[["timestamp", "equity"]])
 
     def build_snapshot(self, view: str) -> Snapshot:
         now = _now()
+        self._tick_counter += 1
         warnings: List[str] = []
 
         master, master_msg, live_path_used = self._read_master_live() if view == "REAL" else (None, None, None)
         hist, hist_msg, hist_path_used, hist_growth_msg = self._read_master_history() if view == "REAL" else (pd.DataFrame(columns=["timestamp", "equity"]), None, None, None)
         series_csv, series_msg, series_path_used = self._read_saldo_series_csv() if view == "REAL" else (pd.DataFrame(columns=["timestamp", "equity"]), None, None)
-        observed = self._parse_observed(view)
-        estimated = self._build_estimated(view)
+        master_ok = bool(view == "REAL" and (not hist.empty or master is not None or not series_csv.empty))
+        aux_tick = (self._tick_counter % max(1, AUX_REFRESH_EVERY_N)) == 0
+        observed = pd.DataFrame(columns=["timestamp", "equity"])
+        estimated = pd.DataFrame(columns=["timestamp", "equity"])
+        if (not master_ok) or aux_tick or view in ("DEMO", "ALL"):
+            observed = self._parse_observed(view)
+        if (not master_ok) or view in ("DEMO", "ALL") or (aux_tick and view == "REAL"):
+            estimated = self._build_estimated(view)
 
         if master_msg and view == "REAL":
             warnings.append(master_msg)
@@ -694,6 +765,8 @@ class DashboardWindow(QtWidgets.QMainWindow):
         self.paused = False
         self._worker_thread: Optional[QtCore.QThread] = None
         self._worker_busy = False
+        self.refresh_in_progress = False
+        self.pending_refresh_skip_count = 0
         self._render_signature = None
         self._last_good_snapshot: Optional[Snapshot] = None
         self._last_metrics: Dict[str, object] = {}
@@ -739,6 +812,7 @@ class DashboardWindow(QtWidgets.QMainWindow):
         self.lbl_now = QtWidgets.QLabel("HORA LOCAL: --"); self.lbl_now.setObjectName("MetaNow")
         self.lbl_last = QtWidgets.QLabel("ÚLTIMA ACT: --"); self.lbl_last.setObjectName("MetaLast")
         self.lbl_state = QtWidgets.QLabel("STATE: IDLE"); self.lbl_state.setObjectName("MetaBox")
+        self.lbl_csv_health = QtWidgets.QLabel("CSV REAL: --"); self.lbl_csv_health.setObjectName("MetaBox")
         self.lbl_rule = QtWidgets.QLabel("RULE: --"); self.lbl_rule.setObjectName("MetaBox")
         meta.addWidget(self.lbl_refresh)
         meta.addWidget(self.lbl_scale)
@@ -746,6 +820,7 @@ class DashboardWindow(QtWidgets.QMainWindow):
         meta.addWidget(self.lbl_samples)
         meta.addWidget(self.lbl_tz)
         meta.addWidget(self.lbl_state)
+        meta.addWidget(self.lbl_csv_health)
         meta.addWidget(self.lbl_rule)
         meta.addWidget(self.lbl_now, 1)
         meta.addWidget(self.lbl_last)
@@ -753,6 +828,19 @@ class DashboardWindow(QtWidgets.QMainWindow):
 
         self.lbl_live_metrics = QtWidgets.QLabel("LIVE: --"); self.lbl_live_metrics.setObjectName("Help")
         hl.addWidget(self.lbl_live_metrics)
+        tools = QtWidgets.QHBoxLayout(); tools.setSpacing(8)
+        self.btn_real = QtWidgets.QPushButton("REAL")
+        self.btn_demo = QtWidgets.QPushButton("DEMO")
+        self.btn_all = QtWidgets.QPushButton("ALL")
+        self.btn_pause = QtWidgets.QPushButton("PAUSA")
+        self.btn_reset = QtWidgets.QPushButton("RESET VISTA")
+        self.btn_export = QtWidgets.QPushButton("EXPORTAR CSV")
+        self.btn_measure = QtWidgets.QPushButton("REGLA")
+        self.btn_markers = QtWidgets.QPushButton("MARCADORES")
+        self.btn_scale = QtWidgets.QPushButton(f"ESCALA: {Y_SCALE_MODE.upper()}")
+        for b in (self.btn_real, self.btn_demo, self.btn_all, self.btn_pause, self.btn_reset, self.btn_export, self.btn_measure, self.btn_markers, self.btn_scale):
+            tools.addWidget(b)
+        hl.addLayout(tools)
         root.addWidget(header)
 
         self.graphics = pg.GraphicsLayoutWidget(); root.addWidget(self.graphics, 1)
@@ -765,6 +853,14 @@ class DashboardWindow(QtWidgets.QMainWindow):
         self._style_plot(self.p_min, "MINUTOS · detalle")
         self._style_plot(self.p_hour, "HORAS · comportamiento")
         self._style_plot(self.p_day, "DÍAS · tendencia")
+        self._measurement_points: List[Tuple[float, float]] = []
+        self._measurement_active = False
+        self._cross_v = pg.InfiniteLine(angle=90, movable=False, pen=pg.mkPen("#587ca8aa", width=1))
+        self._cross_h = pg.InfiniteLine(angle=0, movable=False, pen=pg.mkPen("#587ca8aa", width=1))
+        self.p_main.addItem(self._cross_v, ignoreBounds=True)
+        self.p_main.addItem(self._cross_h, ignoreBounds=True)
+        self._cross_proxy = pg.SignalProxy(self.p_main.scene().sigMouseMoved, rateLimit=30, slot=self._on_mouse_moved)
+        self.p_main.scene().sigMouseClicked.connect(self._on_plot_clicked)
 
         self.plot_states = {
             "main": self._init_plot_state(self.p_main, "#5df2ff", "#d9fbff", VENTANA_DIAS * 86400),
@@ -776,6 +872,15 @@ class DashboardWindow(QtWidgets.QMainWindow):
         self.lbl_warn = QtWidgets.QLabel(""); self.lbl_warn.setObjectName("Warn"); root.addWidget(self.lbl_warn)
         self.lbl_help = QtWidgets.QLabel(f"Teclas: [1]REAL [2]DEMO [3]ALL [F]Fullscreen [P]Pausa [R]Reset [Q]Salir · {MONITOR_VERSION} · {MONITOR_BUILD_ID}")
         self.lbl_help.setObjectName("Help"); root.addWidget(self.lbl_help)
+        self.btn_real.clicked.connect(lambda: self._set_view("REAL"))
+        self.btn_demo.clicked.connect(lambda: self._set_view("DEMO"))
+        self.btn_all.clicked.connect(lambda: self._set_view("ALL"))
+        self.btn_pause.clicked.connect(self._toggle_pause)
+        self.btn_reset.clicked.connect(self._reset_view)
+        self.btn_export.clicked.connect(self._export_visible_csv)
+        self.btn_measure.clicked.connect(self._toggle_measurement)
+        self.btn_markers.clicked.connect(self._toggle_markers)
+        self.btn_scale.clicked.connect(self._cycle_scale_mode)
 
         self.setStyleSheet(
             """
@@ -912,8 +1017,10 @@ class DashboardWindow(QtWidgets.QMainWindow):
     def _start_snapshot_worker(self):
         if self._worker_busy:
             self.skipped_refresh_count += 1
+            self.pending_refresh_skip_count += 1
             return
         self._worker_busy = True
+        self.refresh_in_progress = True
         self.last_worker_started_ts = time.time()
         thread = QtCore.QThread(self)
         worker = SnapshotWorker(self.engine, self.view)
@@ -1017,6 +1124,90 @@ class DashboardWindow(QtWidgets.QMainWindow):
         else:
             super().keyPressEvent(ev)
 
+    def _set_view(self, view: str):
+        self.view = view
+        self.refresh(force=True)
+
+    def _toggle_pause(self):
+        self.paused = not self.paused
+        self.refresh(force=True)
+
+    def _reset_view(self):
+        self.p_main.enableAutoRange(); self.p_min.enableAutoRange(); self.p_hour.enableAutoRange(); self.p_day.enableAutoRange()
+
+    def _on_mouse_moved(self, evt):
+        try:
+            pos = evt[0]
+            if self.p_main.sceneBoundingRect().contains(pos):
+                mouse_point = self.p_main.vb.mapSceneToView(pos)
+                self._cross_v.setPos(mouse_point.x())
+                self._cross_h.setPos(mouse_point.y())
+                self.lbl_help.setText(
+                    f"Cursor · t={datetime.fromtimestamp(float(mouse_point.x()), tz=DISPLAY_TZ).strftime('%H:%M:%S')} | saldo={float(mouse_point.y()):,.2f}"
+                )
+        except Exception:
+            pass
+
+    def _on_plot_clicked(self, evt):
+        if not self._measurement_active:
+            return
+        try:
+            pos = evt.scenePos()
+            if not self.p_main.sceneBoundingRect().contains(pos):
+                return
+            p = self.p_main.vb.mapSceneToView(pos)
+            self._measurement_points.append((float(p.x()), float(p.y())))
+            self._measurement_points = self._measurement_points[-2:]
+            if len(self._measurement_points) == 2:
+                (x1, y1), (x2, y2) = self._measurement_points
+                dt_min = max(1e-9, abs(x2 - x1) / 60.0)
+                d_usd = y2 - y1
+                d_pct = (d_usd / y1 * 100.0) if abs(y1) > 1e-12 else 0.0
+                slope = d_usd / dt_min
+                self.lbl_rule.setText(f"RULE: ΔUSD={d_usd:+,.2f} Δ%={d_pct:+.2f} Δt={dt_min:,.2f}m slope={slope:+,.3f}/m")
+        except Exception:
+            pass
+
+    def _toggle_measurement(self):
+        self._measurement_active = not self._measurement_active
+        if not self._measurement_active:
+            self._measurement_points.clear()
+            self.lbl_rule.setText("RULE: --")
+        self.btn_measure.setText("REGLA ON" if self._measurement_active else "REGLA")
+
+    def _toggle_markers(self):
+        global SHOW_EXTREME_MARKERS
+        SHOW_EXTREME_MARKERS = not SHOW_EXTREME_MARKERS
+        self.btn_markers.setText("MARCADORES ON" if SHOW_EXTREME_MARKERS else "MARCADORES")
+
+    def _cycle_scale_mode(self):
+        global Y_SCALE_MODE
+        modes = ["auto", "capital", "manual"]
+        try:
+            idx = modes.index(Y_SCALE_MODE)
+        except Exception:
+            idx = 0
+        Y_SCALE_MODE = modes[(idx + 1) % len(modes)]
+        self.btn_scale.setText(f"ESCALA: {Y_SCALE_MODE.upper()}")
+        self.refresh(force=True)
+
+    def _export_visible_csv(self):
+        try:
+            if not self._last_good_snapshot:
+                self.lbl_warn.setText("⚠ Export: sin snapshot visible")
+                return
+            vis = _sanitize_series_for_plot(self._last_good_snapshot.series_main)
+            if vis.empty:
+                self.lbl_warn.setText("⚠ Export: sin datos visibles")
+                return
+            out = vis.copy()
+            out["source"] = str(self._last_good_snapshot.source)
+            out["window_tag"] = "main_visible"
+            out.to_csv("monitor_visible_export.csv", index=False)
+            self.lbl_warn.setText(f"✅ Exportado monitor_visible_export.csv ({len(out)} filas)")
+        except Exception as e:
+            self.lbl_warn.setText(f"⚠ Export error: {e}")
+
     def changeEvent(self, ev: QtCore.QEvent):
         if ev.type() == QtCore.QEvent.WindowStateChange:
             interval = REFRESH_SEGUNDOS_MINIMIZADO if self.isMinimized() else REFRESH_SEGUNDOS
@@ -1095,6 +1286,7 @@ class DashboardWindow(QtWidgets.QMainWindow):
     @QtCore.Slot(object, float, float, str)
     def _on_snapshot_ready(self, snap: Snapshot, build_ms: float, finished_ts: float, _view: str):
         self._worker_busy = False
+        self.refresh_in_progress = False
         self.snapshot_build_ms = float(build_ms)
         self.last_worker_finished_ts = float(finished_ts)
         self._last_good_snapshot = snap
@@ -1146,6 +1338,12 @@ class DashboardWindow(QtWidgets.QMainWindow):
                 self.lbl_delta.setText("Δ VIS: --")
             self.lbl_samples.setText(f"MUESTRAS: {n_visible}")
             self.lbl_state.setText("STATE: DEGRADED" if self.degraded_mode_active else "STATE: LIVE")
+            age_s = (snap.now - snap.last_update).total_seconds() if snap.last_update else float("inf")
+            if snap.source == "SERIE_CSV":
+                health = "OK" if age_s <= RULE_STALE_S else "STALE"
+            else:
+                health = "MISSING" if n_visible <= 0 else "OK"
+            self.lbl_csv_health.setText(f"CSV REAL: {health}")
         except Exception:
             snap.warnings.append("header render error")
             traceback.print_exc()
@@ -1208,6 +1406,7 @@ class DashboardWindow(QtWidgets.QMainWindow):
     @QtCore.Slot(str)
     def _on_snapshot_error(self, tb_text: str):
         self._worker_busy = False
+        self.refresh_in_progress = False
         self.last_error_ts = time.time()
         self.consecutive_errors += 1
         if self.consecutive_errors >= DEGRADED_ERRORS_THRESHOLD:
