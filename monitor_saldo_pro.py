@@ -22,6 +22,7 @@ import re
 import sys
 import time
 import traceback
+from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -96,6 +97,8 @@ Y_AXIS_MAX_USD = float(os.getenv("Y_AXIS_MAX_USD", "300"))
 Y_AUTO_SPAN_USD = float(os.getenv("Y_AUTO_SPAN_USD", "120"))
 CAPITAL_BASE_USD = float(os.getenv("CAPITAL_BASE_USD", "0") or "0")
 MIN_X_SPAN_SECONDS = 20.0
+OBSERVED_TAIL_BYTES = int(os.getenv("OBSERVED_TAIL_BYTES", str(256 * 1024)))
+ESTIMATED_REFRESH_SECONDS = int(os.getenv("ESTIMATED_REFRESH_SECONDS", "30"))
 def _safe_display_tz():
     if ZoneInfo is None:
         return timezone.utc
@@ -261,6 +264,10 @@ class DataEngine:
         self._cache: Dict[str, Tuple[Tuple, object]] = {}
         self._history_last_seen: Optional[Tuple[str, int, int]] = None
         self._agg_cache_state: Dict[str, object] = {}
+        self._est_last_build_ts: Dict[str, float] = {}
+        self._est_last_value: Dict[str, pd.DataFrame] = {}
+        self._obs_last_build_ts: Dict[str, float] = {}
+        self._obs_last_value: Dict[str, pd.DataFrame] = {}
 
     @staticmethod
     def _sig(paths: List[Path]) -> Tuple:
@@ -322,6 +329,23 @@ class DataEngine:
     def _store_cache(self, key: str, sig: Tuple, value):
         self._cache[key] = (sig, value)
         return value
+
+    @staticmethod
+    def _read_tail_lines(path: Path, max_bytes: int) -> List[str]:
+        try:
+            with path.open("rb") as fh:
+                fh.seek(0, os.SEEK_END)
+                size = fh.tell()
+                read_from = max(0, size - max(1024, int(max_bytes)))
+                fh.seek(read_from, os.SEEK_SET)
+                data = fh.read()
+            if read_from > 0:
+                nl = data.find(b"\n")
+                if nl >= 0:
+                    data = data[nl + 1 :]
+            return data.decode("utf-8", errors="ignore").splitlines()
+        except Exception:
+            return []
 
     def _read_master_live(self) -> Tuple[Optional[Tuple[float, datetime]], Optional[str], Optional[Path]]:
         paths = self._master_live_candidates()
@@ -463,6 +487,9 @@ class DataEngine:
         cached = self._cached(key, sig)
         if cached is not None:
             return cached
+        now_mono = time.monotonic()
+        if view in self._obs_last_build_ts and (now_mono - self._obs_last_build_ts[view]) < 2.0:
+            return self._obs_last_value.get(view, pd.DataFrame(columns=["timestamp", "equity"]))
 
         patterns = [
             re.compile(r"SALDO\s+EN\s+CUENTA\s+REAL\s+DERIV\s*:\s*([-\d\.,]+)(?:\s*USD)?", re.IGNORECASE),
@@ -476,7 +503,7 @@ class DataEngine:
             if not p.exists() or not p.is_file():
                 continue
             try:
-                lines = p.read_text(encoding="utf-8", errors="ignore").splitlines()
+                lines = self._read_tail_lines(p, OBSERVED_TAIL_BYTES)
             except Exception:
                 continue
             base = datetime.fromtimestamp(p.stat().st_mtime, tz=timezone.utc) - timedelta(seconds=len(lines))
@@ -496,20 +523,36 @@ class DataEngine:
                 rows.append((ts, float(v)))
 
         if not rows:
-            return self._store_cache(key, sig, pd.DataFrame(columns=["timestamp", "equity"]))
+            out = self._store_cache(key, sig, pd.DataFrame(columns=["timestamp", "equity"]))
+            self._obs_last_build_ts[view] = now_mono
+            self._obs_last_value[view] = out
+            return out
         d = pd.DataFrame(rows, columns=["timestamp", "equity"]).sort_values("timestamp")
         d = d.drop_duplicates(subset=["timestamp", "equity"], keep="last")
-        return self._store_cache(key, sig, d)
+        out = self._store_cache(key, sig, d)
+        self._obs_last_build_ts[view] = now_mono
+        self._obs_last_value[view] = out
+        return out
 
     def _build_estimated(self, view: str) -> pd.DataFrame:
+        now_mono = time.monotonic()
+        if view in self._est_last_build_ts and (now_mono - self._est_last_build_ts[view]) < float(ESTIMATED_REFRESH_SECONDS):
+            last = self._est_last_value.get(view)
+            if last is not None:
+                return last
         files = [Path(p) for p in sorted(glob.glob(str(self.base_dir / CSV_PATTERN)))]
         sig = self._sig(files)
         key = f"est:{view}"
         cached = self._cached(key, sig)
         if cached is not None:
+            self._est_last_build_ts[view] = now_mono
+            self._est_last_value[view] = cached
             return cached
         if not files:
-            return self._store_cache(key, sig, pd.DataFrame(columns=["timestamp", "equity"]))
+            out = self._store_cache(key, sig, pd.DataFrame(columns=["timestamp", "equity"]))
+            self._est_last_build_ts[view] = now_mono
+            self._est_last_value[view] = out
+            return out
 
         dfs = []
         for p in files:
@@ -520,11 +563,17 @@ class DataEngine:
                 except Exception:
                     pass
         if not dfs:
-            return self._store_cache(key, sig, pd.DataFrame(columns=["timestamp", "equity"]))
+            out = self._store_cache(key, sig, pd.DataFrame(columns=["timestamp", "equity"]))
+            self._est_last_build_ts[view] = now_mono
+            self._est_last_value[view] = out
+            return out
 
         d = pd.concat(dfs, ignore_index=True)
         if "ganancia_perdida" not in d.columns:
-            return self._store_cache(key, sig, pd.DataFrame(columns=["timestamp", "equity"]))
+            out = self._store_cache(key, sig, pd.DataFrame(columns=["timestamp", "equity"]))
+            self._est_last_build_ts[view] = now_mono
+            self._est_last_value[view] = out
+            return out
         ts = pd.Series(pd.NaT, index=d.index, dtype="datetime64[ns, UTC]")
         if "fecha" in d.columns:
             ts = ts.fillna(pd.to_datetime(d["fecha"], errors="coerce", utc=True))
@@ -541,7 +590,10 @@ class DataEngine:
         pnl = pd.to_numeric(d["ganancia_perdida"], errors="coerce").fillna(0.0)
         base = 1000.0 if view == "REAL" else (10000.0 if view == "DEMO" else 11000.0)
         d["equity"] = base + pnl.cumsum()
-        return self._store_cache(key, sig, d[["timestamp", "equity"]])
+        out = self._store_cache(key, sig, d[["timestamp", "equity"]])
+        self._est_last_build_ts[view] = now_mono
+        self._est_last_value[view] = out
+        return out
 
     def build_snapshot(self, view: str) -> Snapshot:
         now = _now()
@@ -550,8 +602,9 @@ class DataEngine:
         master, master_msg, live_path_used = self._read_master_live() if view == "REAL" else (None, None, None)
         hist, hist_msg, hist_path_used, hist_growth_msg = self._read_master_history() if view == "REAL" else (pd.DataFrame(columns=["timestamp", "equity"]), None, None, None)
         series_csv, series_msg, series_path_used = self._read_saldo_series_csv() if view == "REAL" else (pd.DataFrame(columns=["timestamp", "equity"]), None, None)
-        observed = self._parse_observed(view)
-        estimated = self._build_estimated(view)
+        real_primary_ok = view == "REAL" and (not hist.empty or master is not None or not series_csv.empty)
+        observed = self._parse_observed(view) if (view != "REAL" or not real_primary_ok) else pd.DataFrame(columns=["timestamp", "equity"])
+        estimated = self._build_estimated(view) if (view != "REAL" or not real_primary_ok) else self._est_last_value.get(view, pd.DataFrame(columns=["timestamp", "equity"]))
 
         if master_msg and view == "REAL":
             warnings.append(master_msg)
@@ -577,6 +630,8 @@ class DataEngine:
             )
             if hist_growth_msg:
                 warnings.append(hist_growth_msg)
+            if real_primary_ok:
+                warnings.append("Modo FAST-PATH REAL: fuentes auxiliares en lazy")
 
         source = "SIN DATOS REALES"
         saldo_actual: Optional[float] = None
@@ -675,6 +730,11 @@ class DashboardWindow(QtWidgets.QMainWindow):
         self._refresh_in_progress: bool = False
         self._error_throttle: Dict[str, Tuple[float, int]] = {}
         self._last_plot_series: Dict[str, pd.DataFrame] = {}
+        self._build_ms_hist = deque(maxlen=120)
+        self.follow_latest = True
+        self.rule_enabled = False
+        self.markers_enabled = SHOW_LAST_MARKER
+        self.rule_points: List[Tuple[float, float]] = []
         self.setWindowTitle(f"Monitor Saldo Real Deriv {MONITOR_VERSION}")
         self.resize(1600, 900)
 
@@ -714,6 +774,22 @@ class DashboardWindow(QtWidgets.QMainWindow):
         meta.addWidget(self.lbl_now, 1)
         meta.addWidget(self.lbl_last)
         hl.addLayout(meta)
+
+        controls = QtWidgets.QHBoxLayout(); controls.setSpacing(8)
+        self.btn_real = QtWidgets.QPushButton("REAL")
+        self.btn_demo = QtWidgets.QPushButton("DEMO")
+        self.btn_all = QtWidgets.QPushButton("ALL")
+        self.btn_pause = QtWidgets.QPushButton("PAUSA")
+        self.btn_reset = QtWidgets.QPushButton("RESET VISTA")
+        self.btn_export = QtWidgets.QPushButton("EXPORTAR CSV")
+        self.btn_rule = QtWidgets.QPushButton("REGLA: OFF")
+        self.btn_markers = QtWidgets.QPushButton("MARCADORES: ON")
+        self.btn_freeze = QtWidgets.QPushButton("FREEZE VIEW: OFF")
+        for b in (self.btn_real, self.btn_demo, self.btn_all, self.btn_pause, self.btn_reset, self.btn_export, self.btn_rule, self.btn_markers, self.btn_freeze):
+            b.setObjectName("MetaBox")
+            controls.addWidget(b)
+        controls.addStretch(1)
+        hl.addLayout(controls)
         root.addWidget(header)
 
         self.graphics = pg.GraphicsLayoutWidget(); root.addWidget(self.graphics, 1)
@@ -735,7 +811,10 @@ class DashboardWindow(QtWidgets.QMainWindow):
         }
 
         self.lbl_warn = QtWidgets.QLabel(""); self.lbl_warn.setObjectName("Warn"); root.addWidget(self.lbl_warn)
-        self.lbl_help = QtWidgets.QLabel(f"Teclas: [1]REAL [2]DEMO [3]ALL [F]Fullscreen [P]Pausa [R]Reset [Q]Salir · {MONITOR_VERSION} · {MONITOR_BUILD_ID}")
+        self.lbl_stats = QtWidgets.QLabel("STATS VIS: --")
+        self.lbl_stats.setObjectName("Warn")
+        root.addWidget(self.lbl_stats)
+        self.lbl_help = QtWidgets.QLabel(f"Teclas: [1]REAL [2]DEMO [3]ALL [F]Fullscreen [P]Pausa [R]Reset [E]Export [G]Regla [C]Limpiar regla [M]Marcadores [V]Freeze [Q]Salir · {MONITOR_VERSION} · {MONITOR_BUILD_ID}")
         self.lbl_help.setObjectName("Help"); root.addWidget(self.lbl_help)
 
         self.setStyleSheet(
@@ -762,6 +841,18 @@ class DashboardWindow(QtWidgets.QMainWindow):
         self.timer = QtCore.QTimer(self)
         self.timer.timeout.connect(self.refresh)
         self.timer.start(int(REFRESH_SEGUNDOS * 1000))
+
+        self.btn_real.clicked.connect(lambda: self._switch_view("REAL"))
+        self.btn_demo.clicked.connect(lambda: self._switch_view("DEMO"))
+        self.btn_all.clicked.connect(lambda: self._switch_view("ALL"))
+        self.btn_pause.clicked.connect(self._toggle_pause)
+        self.btn_reset.clicked.connect(self._reset_view)
+        self.btn_export.clicked.connect(self._export_visible_csv)
+        self.btn_rule.clicked.connect(self._toggle_rule_mode)
+        self.btn_markers.clicked.connect(self._toggle_markers)
+        self.btn_freeze.clicked.connect(self._toggle_freeze)
+
+        self._init_crosshair()
 
         if FULLSCREEN_INICIAL:
             self.showMaximized()
@@ -841,6 +932,106 @@ class DashboardWindow(QtWidgets.QMainWindow):
         else:
             plot.setXRange(xmax - float(canonical_window_s), xmax, padding=0.0)
 
+    def _switch_view(self, view: str):
+        self.view = view
+        self.refresh(force=True)
+
+    def _toggle_pause(self):
+        self.paused = not self.paused
+        self.btn_pause.setText(f"PAUSA: {'ON' if self.paused else 'OFF'}")
+        self.refresh(force=True)
+
+    def _reset_view(self):
+        self.p_main.enableAutoRange(); self.p_min.enableAutoRange(); self.p_hour.enableAutoRange(); self.p_day.enableAutoRange()
+        self.follow_latest = True
+        self.btn_freeze.setText("FREEZE VIEW: OFF")
+
+    def _toggle_freeze(self):
+        self.follow_latest = not self.follow_latest
+        self.btn_freeze.setText(f"FREEZE VIEW: {'OFF' if self.follow_latest else 'ON'}")
+
+    def _toggle_rule_mode(self):
+        self.rule_enabled = not self.rule_enabled
+        if not self.rule_enabled:
+            self.rule_points = []
+        self.btn_rule.setText(f"REGLA: {'ON' if self.rule_enabled else 'OFF'}")
+
+    def _toggle_markers(self):
+        self.markers_enabled = not self.markers_enabled
+        self.btn_markers.setText(f"MARCADORES: {'ON' if self.markers_enabled else 'OFF'}")
+
+    def _init_crosshair(self):
+        self.cross_v = pg.InfiniteLine(angle=90, movable=False, pen=pg.mkPen("#6688aa88"))
+        self.cross_h = pg.InfiniteLine(angle=0, movable=False, pen=pg.mkPen("#6688aa88"))
+        self.p_main.addItem(self.cross_v, ignoreBounds=True)
+        self.p_main.addItem(self.cross_h, ignoreBounds=True)
+        self.main_curve_proxy = pg.SignalProxy(self.p_main.scene().sigMouseMoved, rateLimit=45, slot=self._on_mouse_moved)
+        self.main_click_proxy = pg.SignalProxy(self.p_main.scene().sigMouseClicked, rateLimit=20, slot=self._on_mouse_clicked)
+
+    def _on_mouse_moved(self, evt):
+        if not evt:
+            return
+        pos = evt[0]
+        if not self.p_main.sceneBoundingRect().contains(pos):
+            return
+        point = self.p_main.vb.mapSceneToView(pos)
+        x, y = float(point.x()), float(point.y())
+        self.cross_v.setPos(x); self.cross_h.setPos(y)
+        main_vis = _sanitize_series_for_plot(self._last_plot_series.get("main", pd.DataFrame(columns=["timestamp", "equity"])))
+        if main_vis.empty:
+            return
+        ts = datetime.fromtimestamp(x, tz=timezone.utc).astimezone(DISPLAY_TZ)
+        first = float(main_vis["equity"].iloc[0])
+        delta = y - first
+        pct = (delta / first * 100.0) if abs(first) > 1e-12 else 0.0
+        self.p_main.setToolTip(
+            f"{ts.strftime('%Y-%m-%d %H:%M:%S %Z')}\n"
+            f"Saldo: {y:,.2f} USD\n"
+            f"Δ vs primer visible: {delta:+,.2f} USD ({pct:+.2f}%)"
+        )
+
+    def _on_mouse_clicked(self, evt):
+        if not evt or not self.rule_enabled:
+            return
+        mouse_event = evt[0]
+        if mouse_event.button() != QtCore.Qt.LeftButton:
+            return
+        scene_pos = mouse_event.scenePos()
+        if not self.p_main.sceneBoundingRect().contains(scene_pos):
+            return
+        point = self.p_main.vb.mapSceneToView(scene_pos)
+        self.rule_points.append((float(point.x()), float(point.y())))
+        if len(self.rule_points) > 2:
+            self.rule_points = self.rule_points[-2:]
+        if len(self.rule_points) == 2:
+            self._render_rule_stats()
+
+    def _render_rule_stats(self):
+        (x1, y1), (x2, y2) = self.rule_points
+        dt_s = max(0.0, x2 - x1)
+        delta = y2 - y1
+        pct = (delta / y1 * 100.0) if abs(y1) > 1e-12 else 0.0
+        usd_min = (delta / (dt_s / 60.0)) if dt_s > 0 else 0.0
+        pct_hour = (pct / (dt_s / 3600.0)) if dt_s > 0 else 0.0
+        self.lbl_stats.setText(
+            f"REGLA A→B | ΔUSD={delta:+,.2f} | Δ%={pct:+.2f}% | Δt={dt_s/60.0:,.1f} min | Pend={usd_min:+,.2f} USD/min | {pct_hour:+.2f}%/h"
+        )
+
+    def _export_visible_csv(self):
+        vis = _sanitize_series_for_plot(self._last_plot_series.get("main", pd.DataFrame(columns=["timestamp", "equity"])))
+        if vis.empty:
+            self.lbl_warn.setText("⚠ Exportación omitida: no hay serie visible")
+            return
+        now_tag = datetime.now().strftime("%Y%m%d_%H%M%S")
+        out_path = self.engine.base_dir / f"monitor_visible_export_{self.view.lower()}_{now_tag}.csv"
+        src = (self.last_good_source or "--")
+        exp = vis.copy()
+        exp["source"] = src
+        exp["view"] = self.view
+        exp["window_tag"] = "visible_main"
+        exp.to_csv(out_path, index=False, columns=["timestamp", "equity", "source", "view", "window_tag"])
+        self.lbl_warn.setText(f"⚠ Exportado visible CSV: {out_path}")
+
     def keyPressEvent(self, ev: QtGui.QKeyEvent):
         k = ev.key()
         if k == QtCore.Qt.Key_1:
@@ -852,9 +1043,20 @@ class DashboardWindow(QtWidgets.QMainWindow):
         elif k == QtCore.Qt.Key_F:
             self.showNormal() if self.isFullScreen() else self.showFullScreen()
         elif k == QtCore.Qt.Key_P:
-            self.paused = not self.paused; self.refresh(force=True)
+            self._toggle_pause()
         elif k == QtCore.Qt.Key_R:
-            self.p_main.enableAutoRange(); self.p_min.enableAutoRange(); self.p_hour.enableAutoRange(); self.p_day.enableAutoRange()
+            self._reset_view()
+        elif k == QtCore.Qt.Key_E:
+            self._export_visible_csv()
+        elif k == QtCore.Qt.Key_G:
+            self._toggle_rule_mode()
+        elif k == QtCore.Qt.Key_C:
+            self.rule_points = []
+            self.lbl_stats.setText("STATS VIS: --")
+        elif k == QtCore.Qt.Key_M:
+            self._toggle_markers()
+        elif k == QtCore.Qt.Key_V:
+            self._toggle_freeze()
         elif k == QtCore.Qt.Key_Q:
             self.close()
         else:
@@ -922,11 +1124,11 @@ class DashboardWindow(QtWidgets.QMainWindow):
             txt.setText("1 punto: esperando más histórico")
 
         marker_size = 8 if len(x) == 1 else 4
-        if SHOW_LAST_MARKER:
+        if self.markers_enabled and SHOW_LAST_MARKER:
             last.setData([x[-1]], [y[-1]], symbolSize=marker_size)
         else:
             last.setData([], [])
-        if SHOW_EXTREME_MARKERS and len(x) >= 8:
+        if self.markers_enabled and SHOW_EXTREME_MARKERS and len(x) >= 8:
             imax = int(np.argmax(y)); imin = int(np.argmin(y))
             vmax.setData([x[imax]], [y[imax]])
             vmin.setData([x[imin]], [y[imin]])
@@ -935,7 +1137,8 @@ class DashboardWindow(QtWidgets.QMainWindow):
             vmin.setData([], [])
         y0, y1, scale_info = self._resolve_y_range(y)
         plot.setYRange(y0, y1, padding=0.0)
-        self._set_x_range_visible(plot, x, int(state["canonical_window_s"]))
+        if self.follow_latest:
+            self._set_x_range_visible(plot, x, int(state["canonical_window_s"]))
         return scale_info, y0, y1
 
     def refresh(self, force: bool = False):
@@ -955,6 +1158,7 @@ class DashboardWindow(QtWidgets.QMainWindow):
             build_t0 = time.perf_counter()
             snap = self.engine.build_snapshot(self.view)
             self.last_build_ms = (time.perf_counter() - build_t0) * 1000.0
+            self._build_ms_hist.append(self.last_build_ms)
             current_valid = self._is_snapshot_valid(snap)
             self._update_last_good(snap)
 
@@ -1044,6 +1248,21 @@ class DashboardWindow(QtWidgets.QMainWindow):
             else:
                 self.lbl_delta.setText("Δ VIS: --")
             self.lbl_samples.setText(f"MUESTRAS: {n_visible}")
+            if n_visible >= 1:
+                min_v = float(visible["equity"].min())
+                max_v = float(visible["equity"].max())
+                first_v = float(visible["equity"].iloc[0])
+                last_v = float(visible["equity"].iloc[-1])
+                dd = min_v - max_v
+                amp_pct = ((max_v - min_v) / first_v * 100.0) if abs(first_v) > 1e-12 else 0.0
+                self.lbl_stats.setText(
+                    f"VIS | first={first_v:,.2f} last={last_v:,.2f} max={max_v:,.2f} min={min_v:,.2f} "
+                    f"drawdown={dd:,.2f} rango={max_v-min_v:,.2f} amp={amp_pct:.2f}% pts={n_visible}"
+                )
+            elif not self.rule_enabled:
+                self.lbl_stats.setText("STATS VIS: --")
+            if self.rule_enabled and len(self.rule_points) == 2:
+                self._render_rule_stats()
 
             last_good_age = "--"
             if self.last_good_last_update is not None:
@@ -1068,6 +1287,7 @@ class DashboardWindow(QtWidgets.QMainWindow):
                             f"Fuente último saldo válido: {self.last_good_source or '--'}",
                             f"Edad último saldo válido: {last_good_age}",
                             f"build ms: {self.last_build_ms:,.2f}",
+                            f"build ms avg: {np.mean(self._build_ms_hist):,.2f}" if self._build_ms_hist else "build ms avg: --",
                             f"refresh skipped: {self.refresh_skipped}",
                             f"worker running: {'yes' if self.worker_running else 'no'}",
                             f"filas series_real: {len(_sanitize_series_for_plot(snap.series_real))}",
@@ -1088,6 +1308,7 @@ class DashboardWindow(QtWidgets.QMainWindow):
                     f"Fuente último saldo válido: {self.last_good_source or '--'}\n"
                     f"Edad último saldo válido: {last_good_age}\n"
                     f"build ms: {self.last_build_ms:,.2f}\n"
+                    f"build ms avg: {np.mean(self._build_ms_hist):,.2f}\n"
                     f"refresh skipped: {self.refresh_skipped}\n"
                     f"worker running: {'yes' if self.worker_running else 'no'}\n"
                     f"filas series_real: {len(_sanitize_series_for_plot(snap.series_real))}\n"
