@@ -89,7 +89,7 @@ MONITOR_BUILD_ID = "MONITOR_SALDO_PRO_REAL_SERIES_GUARD"
 MIN_POINTS_FOR_LINE = 2
 SHOW_LAST_MARKER = True
 SHOW_EXTREME_MARKERS = False
-Y_SCALE_MODE = os.getenv("Y_SCALE_MODE", "capital").strip().lower()  # capital | manual | auto
+Y_SCALE_MODE = os.getenv("Y_SCALE_MODE", "auto").strip().lower()  # capital | manual | auto
 Y_AXIS_MIN_USD = float(os.getenv("Y_AXIS_MIN_USD", "0"))
 Y_AXIS_MAX_USD = float(os.getenv("Y_AXIS_MAX_USD", "300"))
 Y_AUTO_SPAN_USD = float(os.getenv("Y_AUTO_SPAN_USD", "120"))
@@ -771,7 +771,7 @@ class DashboardWindow(QtWidgets.QMainWindow):
             if CAPITAL_BASE_USD > 0:
                 base = float(CAPITAL_BASE_USD)
             elif y is not None and len(y) > 0:
-                base = float(max(1.0, np.nanmedian(y)))
+                base = float(max(0.01, y[-1]))
             else:
                 base = 10.0
             data_span = 0.0
@@ -784,11 +784,18 @@ class DashboardWindow(QtWidgets.QMainWindow):
         if y is None or len(y) == 0:
             span = float(max(10.0, Y_AUTO_SPAN_USD))
             return 0.0, span, f"auto · span={span:,.2f}"
-        center = float(np.nanmedian(y))
-        span = float(max(10.0, Y_AUTO_SPAN_USD))
-        y0 = max(0.0, center - span * 0.5)
-        y1 = y0 + span
-        return y0, y1, f"auto · span={span:,.2f}"
+        ymin_data = float(np.nanmin(y))
+        ymax_data = float(np.nanmax(y))
+        span = float(max(0.0, ymax_data - ymin_data))
+        if span < 1e-9:
+            pad = max(0.5, abs(ymin_data) * 0.10)
+        else:
+            pad = max(0.25, span * 0.08)
+        y0 = max(0.0, ymin_data - pad)
+        y1 = ymax_data + pad
+        if y1 - y0 < 0.5:
+            y1 = y0 + 0.5
+        return y0, y1, f"auto · data=[{ymin_data:,.2f},{ymax_data:,.2f}]"
 
     def _init_plot_state(self, plot: pg.PlotItem, color: str, endpoint: str, canonical_window_s: int) -> Dict[str, object]:
         glow = plot.plot([], [], pen=pg.mkPen(color + "55", width=8.0), name=None)
@@ -841,7 +848,7 @@ class DashboardWindow(QtWidgets.QMainWindow):
             self.timer.setInterval(int(interval * 1000))
         super().changeEvent(ev)
 
-    def _update_plot_state(self, state: Dict[str, object], s: pd.DataFrame) -> str:
+    def _update_plot_state(self, state: Dict[str, object], s: pd.DataFrame) -> Tuple[str, float, float]:
         plot = state["plot"]
         glow = state["glow"]; line = state["line"]; last = state["last"]; vmax = state["max"]; vmin = state["min"]; txt = state["text"]
         s = _sanitize_series_for_plot(s)
@@ -852,7 +859,9 @@ class DashboardWindow(QtWidgets.QMainWindow):
             vmax.setData([], [])
             vmin.setData([], [])
             txt.setText("Sin puntos")
-            return "sin datos"
+            y0, y1, scale_info = self._resolve_y_range(None)
+            plot.setYRange(y0, y1, padding=0.0)
+            return "sin datos", y0, y1
 
         x = (s["timestamp"].astype("int64") / 1e9).to_numpy(dtype=float)
         y = s["equity"].to_numpy(dtype=float)
@@ -881,7 +890,7 @@ class DashboardWindow(QtWidgets.QMainWindow):
         y0, y1, scale_info = self._resolve_y_range(y)
         plot.setYRange(y0, y1, padding=0.0)
         self._set_x_range_visible(plot, x, int(state["canonical_window_s"]))
-        return scale_info
+        return scale_info, y0, y1
 
     def refresh(self, force: bool = False):
         if self.paused and not force:
@@ -916,6 +925,7 @@ class DashboardWindow(QtWidgets.QMainWindow):
             self.lbl_source.style().unpolish(self.lbl_source); self.lbl_source.style().polish(self.lbl_source)
 
             main_scale = "--"
+            main_y0, main_y1 = 0.0, 0.0
             for key, series in (
                 ("main", snap.series_main),
                 ("min", snap.series_minutes),
@@ -923,9 +933,10 @@ class DashboardWindow(QtWidgets.QMainWindow):
                 ("day", snap.series_days),
             ):
                 try:
-                    scale_info = self._update_plot_state(self.plot_states[key], series)
+                    scale_info, py0, py1 = self._update_plot_state(self.plot_states[key], series)
                     if key == "main":
                         main_scale = scale_info
+                        main_y0, main_y1 = py0, py1
                 except Exception as plot_err:
                     snap.warnings.append(f"plot {key} con error: {plot_err}")
             self.lbl_scale.setText(f"ESCALA Y: {main_scale}")
@@ -944,10 +955,21 @@ class DashboardWindow(QtWidgets.QMainWindow):
             if snap.warnings:
                 compact = [w.strip()[:110] + ("…" if len(w.strip()) > 110 else "") for w in snap.warnings[:3]]
                 self.lbl_warn.setText("⚠ " + " · ".join(compact))
-                self.lbl_warn.setToolTip("\n".join(snap.warnings + [f"Escala efectiva: {main_scale}"]))
+                self.lbl_warn.setToolTip(
+                    "\n".join(
+                        snap.warnings
+                        + [
+                            f"Escala efectiva: {main_scale}",
+                            f"Escala main: {Y_SCALE_MODE} | y=[{main_y0:,.2f}, {main_y1:,.2f}]",
+                        ]
+                    )
+                )
             else:
                 self.lbl_warn.setText("")
-                self.lbl_warn.setToolTip(f"Escala efectiva: {main_scale}")
+                self.lbl_warn.setToolTip(
+                    f"Escala efectiva: {main_scale}\n"
+                    f"Escala main: {Y_SCALE_MODE} | y=[{main_y0:,.2f}, {main_y1:,.2f}]"
+                )
         except Exception as e:
             self.lbl_warn.setText(f"⚠ Error monitor: {e}")
             traceback.print_exc()
