@@ -20,6 +20,7 @@ import json
 import os
 import re
 import sys
+import time
 import traceback
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -185,6 +186,13 @@ def _safe_float(x, default=np.nan):
         return float(x)
     except Exception:
         return default
+
+
+def _is_valid_number(v) -> bool:
+    try:
+        return v is not None and np.isfinite(float(v))
+    except Exception:
+        return False
 
 
 class SmartDateAxis(pg.DateAxisItem):
@@ -657,6 +665,16 @@ class DashboardWindow(QtWidgets.QMainWindow):
         self.engine = engine
         self.view = CUENTA_OBJETIVO if CUENTA_OBJETIVO in ("REAL", "DEMO", "ALL") else "REAL"
         self.paused = False
+        self.last_good_snapshot: Optional[Snapshot] = None
+        self.last_good_saldo: Optional[float] = None
+        self.last_good_source: Optional[str] = None
+        self.last_good_last_update: Optional[datetime] = None
+        self.last_build_ms: float = 0.0
+        self.refresh_skipped: int = 0
+        self.worker_running: bool = False
+        self._refresh_in_progress: bool = False
+        self._error_throttle: Dict[str, Tuple[float, int]] = {}
+        self._last_plot_series: Dict[str, pd.DataFrame] = {}
         self.setWindowTitle(f"Monitor Saldo Real Deriv {MONITOR_VERSION}")
         self.resize(1600, 900)
 
@@ -848,6 +866,34 @@ class DashboardWindow(QtWidgets.QMainWindow):
             self.timer.setInterval(int(interval * 1000))
         super().changeEvent(ev)
 
+    def _is_snapshot_valid(self, snap: Snapshot) -> bool:
+        return (
+            _is_valid_number(snap.saldo_actual)
+            or (snap.series_real is not None and not snap.series_real.empty)
+            or (snap.series_main is not None and not snap.series_main.empty)
+        )
+
+    def _update_last_good(self, snap: Snapshot):
+        if not self._is_snapshot_valid(snap):
+            return
+        self.last_good_snapshot = snap
+        if _is_valid_number(snap.saldo_actual):
+            self.last_good_saldo = float(snap.saldo_actual)
+        if snap.source:
+            self.last_good_source = snap.source
+        if snap.last_update is not None:
+            self.last_good_last_update = snap.last_update
+
+    def _throttled_warn(self, key: str, msg: str, cooldown_s: float = 20.0):
+        now_mono = time.monotonic()
+        prev = self._error_throttle.get(key, (0.0, 0))
+        last_ts, count = prev
+        count += 1
+        self._error_throttle[key] = (now_mono, count)
+        if (now_mono - last_ts) >= cooldown_s:
+            print(f"[MONITOR][WARN] {msg} (x{count})")
+            self._error_throttle[key] = (now_mono, 0)
+
     def _update_plot_state(self, state: Dict[str, object], s: pd.DataFrame) -> Tuple[str, float, float]:
         plot = state["plot"]
         glow = state["glow"]; line = state["line"]; last = state["last"]; vmax = state["max"]; vmin = state["min"]; txt = state["text"]
@@ -894,31 +940,62 @@ class DashboardWindow(QtWidgets.QMainWindow):
 
     def refresh(self, force: bool = False):
         if self.paused and not force:
+            self.refresh_skipped += 1
             return
         if self.isMinimized() and not force:
+            self.refresh_skipped += 1
             return
+        if self._refresh_in_progress and not force:
+            self.refresh_skipped += 1
+            return
+        self._refresh_in_progress = True
         try:
             if not MONITOR_BUILD_ID or MIN_POINTS_FOR_LINE != 2:
                 self.lbl_warn.setText("⚠ Versión desactualizada o incompleta del monitor detectada")
+            build_t0 = time.perf_counter()
             snap = self.engine.build_snapshot(self.view)
-            self.lbl_big.setText(_fmt_money(snap.saldo_actual))
+            self.last_build_ms = (time.perf_counter() - build_t0) * 1000.0
+            current_valid = self._is_snapshot_valid(snap)
+            self._update_last_good(snap)
+
+            status = "OK"
+            if not current_valid and self.last_good_snapshot is not None:
+                status = "STALE"
+            elif current_valid and self.view == "REAL" and snap.source in ("SERIE_CSV", "OBSERVADO", "LIVE"):
+                status = "DEGRADED"
+            elif not current_valid and self.last_good_snapshot is None:
+                status = "NO DATA"
+
+            effective_saldo = snap.saldo_actual if _is_valid_number(snap.saldo_actual) else self.last_good_saldo
+            if _is_valid_number(effective_saldo):
+                self.lbl_big.setText(_fmt_money(float(effective_saldo)))
+            else:
+                self.lbl_big.setText("--")
+
             refresh_state = "PAUSADO" if self.paused else "ACTIVO"
-            last = snap.last_update.astimezone(DISPLAY_TZ).strftime("%Y-%m-%d %H:%M:%S %Z") if snap.last_update else "--"
+            effective_last_update = snap.last_update if snap.last_update else self.last_good_last_update
+            last = effective_last_update.astimezone(DISPLAY_TZ).strftime("%Y-%m-%d %H:%M:%S %Z") if effective_last_update else "--"
             self.lbl_refresh.setText(f"REFRESCO: {refresh_state}")
             self.lbl_now.setText(f"HORA LOCAL: {snap.now.strftime('%H:%M:%S %Z')}")
             self.lbl_last.setText(f"ÚLTIMA ACT: {last}")
 
-            src = snap.source.upper().strip()
-            self.lbl_source.setText(f"FUENTE: {src}")
-            if src == "MAESTRO":
-                self.lbl_source.setObjectName("BadgeMaster"); self.lbl_big.setStyleSheet("color:#72f8b1;")
-            elif src in ("OBSERVADO", "MAESTRO_HIST", "SERIE_CSV"):
-                self.lbl_source.setObjectName("BadgeObserved"); self.lbl_big.setStyleSheet("color:#67efff;")
-            elif src == "LIVE":
-                self.lbl_source.setObjectName("BadgeLive"); self.lbl_big.setStyleSheet("color:#9ef7d8;")
-            elif src == "STALE":
+            raw_src = snap.source.upper().strip()
+            effective_src = raw_src if current_valid else ((self.last_good_source or raw_src).upper().strip() if self.last_good_source or raw_src else "--")
+            source_label = f"FUENTE: {effective_src} · {status}"
+            self.lbl_source.setText(source_label)
+            if status == "NO DATA":
+                self.lbl_source.setObjectName("BadgeBad"); self.lbl_big.setStyleSheet("color:#ffb9b9;")
+            elif status == "STALE":
                 self.lbl_source.setObjectName("BadgeWarn"); self.lbl_big.setStyleSheet("color:#ffe9b8;")
-            elif src in ("ESTIMADO", "SIN DATOS REALES"):
+            elif status == "DEGRADED":
+                self.lbl_source.setObjectName("BadgeObserved"); self.lbl_big.setStyleSheet("color:#67efff;")
+            elif effective_src == "MAESTRO":
+                self.lbl_source.setObjectName("BadgeMaster"); self.lbl_big.setStyleSheet("color:#72f8b1;")
+            elif effective_src in ("OBSERVADO", "MAESTRO_HIST", "SERIE_CSV"):
+                self.lbl_source.setObjectName("BadgeObserved"); self.lbl_big.setStyleSheet("color:#67efff;")
+            elif effective_src == "LIVE":
+                self.lbl_source.setObjectName("BadgeLive"); self.lbl_big.setStyleSheet("color:#9ef7d8;")
+            elif effective_src in ("ESTIMADO", "SIN DATOS REALES"):
                 self.lbl_source.setObjectName("BadgeBad"); self.lbl_big.setStyleSheet("color:#ffb9b9;")
             else:
                 self.lbl_source.setObjectName("BadgeNeutral"); self.lbl_big.setStyleSheet("color:#d8e7ff;")
@@ -926,21 +1003,37 @@ class DashboardWindow(QtWidgets.QMainWindow):
 
             main_scale = "--"
             main_y0, main_y1 = 0.0, 0.0
+            series_map = {
+                "main": snap.series_main,
+                "min": snap.series_minutes,
+                "hour": snap.series_hours,
+                "day": snap.series_days,
+            }
             for key, series in (
-                ("main", snap.series_main),
-                ("min", snap.series_minutes),
-                ("hour", snap.series_hours),
-                ("day", snap.series_days),
+                ("main", series_map["main"]),
+                ("min", series_map["min"]),
+                ("hour", series_map["hour"]),
+                ("day", series_map["day"]),
             ):
                 try:
-                    scale_info, py0, py1 = self._update_plot_state(self.plot_states[key], series)
+                    use_series = _sanitize_series_for_plot(series)
+                    if use_series.empty and key in self._last_plot_series and not self._last_plot_series[key].empty:
+                        use_series = self._last_plot_series[key]
+                        if status in ("STALE", "DEGRADED"):
+                            snap.warnings.append(f"Mostrando última serie válida en panel {key}")
+                    elif not use_series.empty:
+                        self._last_plot_series[key] = use_series
+                    scale_info, py0, py1 = self._update_plot_state(self.plot_states[key], use_series)
                     if key == "main":
                         main_scale = scale_info
                         main_y0, main_y1 = py0, py1
                 except Exception as plot_err:
                     snap.warnings.append(f"plot {key} con error: {plot_err}")
+                    self._throttled_warn(f"plot:{key}", f"Error en gráfico {key}: {plot_err}")
             self.lbl_scale.setText(f"ESCALA Y: {main_scale}")
-            visible = _sanitize_series_for_plot(snap.series_main)
+            visible = _sanitize_series_for_plot(series_map["main"])
+            if visible.empty and "main" in self._last_plot_series:
+                visible = self._last_plot_series["main"]
             n_visible = int(len(visible))
             if n_visible >= 1:
                 first = float(visible["equity"].iloc[0])
@@ -952,6 +1045,17 @@ class DashboardWindow(QtWidgets.QMainWindow):
                 self.lbl_delta.setText("Δ VIS: --")
             self.lbl_samples.setText(f"MUESTRAS: {n_visible}")
 
+            last_good_age = "--"
+            if self.last_good_last_update is not None:
+                age_s = max(0.0, (snap.now - self.last_good_last_update.astimezone(DISPLAY_TZ)).total_seconds())
+                last_good_age = f"{age_s:,.1f}s"
+            if status == "STALE":
+                snap.warnings.insert(0, "Mostrando último saldo válido")
+            elif status == "DEGRADED":
+                snap.warnings.insert(0, "Modo degradado: fuente principal no disponible, fallback válido activo")
+            elif status == "NO DATA":
+                snap.warnings.insert(0, "No hay datos válidos desde el arranque")
+
             if snap.warnings:
                 compact = [w.strip()[:110] + ("…" if len(w.strip()) > 110 else "") for w in snap.warnings[:3]]
                 self.lbl_warn.setText("⚠ " + " · ".join(compact))
@@ -959,6 +1063,18 @@ class DashboardWindow(QtWidgets.QMainWindow):
                     "\n".join(
                         snap.warnings
                         + [
+                            f"Estado: {status}",
+                            f"Fuente efectiva actual: {effective_src}",
+                            f"Fuente último saldo válido: {self.last_good_source or '--'}",
+                            f"Edad último saldo válido: {last_good_age}",
+                            f"build ms: {self.last_build_ms:,.2f}",
+                            f"refresh skipped: {self.refresh_skipped}",
+                            f"worker running: {'yes' if self.worker_running else 'no'}",
+                            f"filas series_real: {len(_sanitize_series_for_plot(snap.series_real))}",
+                            f"filas series_main: {len(_sanitize_series_for_plot(snap.series_main))}",
+                            f"ruta live: {SALDO_LIVE_SHARED_PATH}",
+                            f"ruta history: {SALDO_LIVE_HISTORY_SHARED_PATH}",
+                            f"ruta series csv: {SALDO_SERIES_CSV_PATH}",
                             f"Escala efectiva: {main_scale}",
                             f"Escala main: {Y_SCALE_MODE} | y=[{main_y0:,.2f}, {main_y1:,.2f}]",
                         ]
@@ -967,12 +1083,28 @@ class DashboardWindow(QtWidgets.QMainWindow):
             else:
                 self.lbl_warn.setText("")
                 self.lbl_warn.setToolTip(
+                    f"Estado: {status}\n"
+                    f"Fuente efectiva actual: {effective_src}\n"
+                    f"Fuente último saldo válido: {self.last_good_source or '--'}\n"
+                    f"Edad último saldo válido: {last_good_age}\n"
+                    f"build ms: {self.last_build_ms:,.2f}\n"
+                    f"refresh skipped: {self.refresh_skipped}\n"
+                    f"worker running: {'yes' if self.worker_running else 'no'}\n"
+                    f"filas series_real: {len(_sanitize_series_for_plot(snap.series_real))}\n"
+                    f"filas series_main: {len(_sanitize_series_for_plot(snap.series_main))}\n"
+                    f"ruta live: {SALDO_LIVE_SHARED_PATH}\n"
+                    f"ruta history: {SALDO_LIVE_HISTORY_SHARED_PATH}\n"
+                    f"ruta series csv: {SALDO_SERIES_CSV_PATH}\n"
                     f"Escala efectiva: {main_scale}\n"
                     f"Escala main: {Y_SCALE_MODE} | y=[{main_y0:,.2f}, {main_y1:,.2f}]"
                 )
         except Exception as e:
-            self.lbl_warn.setText(f"⚠ Error monitor: {e}")
-            traceback.print_exc()
+            self._throttled_warn("refresh", f"Error monitor: {e}")
+            if self.last_good_saldo is not None:
+                self.lbl_big.setText(_fmt_money(self.last_good_saldo))
+            self.lbl_warn.setText(f"⚠ Error monitor (conservando último dato válido): {e}")
+        finally:
+            self._refresh_in_progress = False
 
 
 def main():
