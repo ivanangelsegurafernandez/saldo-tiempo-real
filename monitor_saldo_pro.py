@@ -198,6 +198,13 @@ def _is_valid_number(v) -> bool:
         return False
 
 
+def _is_valid_number(v) -> bool:
+    try:
+        return v is not None and np.isfinite(float(v))
+    except Exception:
+        return False
+
+
 class SmartDateAxis(pg.DateAxisItem):
     def tickStrings(self, values, scale, spacing):
         if not values:
@@ -329,6 +336,23 @@ class DataEngine:
     def _store_cache(self, key: str, sig: Tuple, value):
         self._cache[key] = (sig, value)
         return value
+
+    @staticmethod
+    def _read_tail_lines(path: Path, max_bytes: int) -> List[str]:
+        try:
+            with path.open("rb") as fh:
+                fh.seek(0, os.SEEK_END)
+                size = fh.tell()
+                read_from = max(0, size - max(1024, int(max_bytes)))
+                fh.seek(read_from, os.SEEK_SET)
+                data = fh.read()
+            if read_from > 0:
+                nl = data.find(b"\n")
+                if nl >= 0:
+                    data = data[nl + 1 :]
+            return data.decode("utf-8", errors="ignore").splitlines()
+        except Exception:
+            return []
 
     @staticmethod
     def _read_tail_lines(path: Path, max_bytes: int) -> List[str]:
@@ -1032,6 +1056,106 @@ class DashboardWindow(QtWidgets.QMainWindow):
         exp.to_csv(out_path, index=False, columns=["timestamp", "equity", "source", "view", "window_tag"])
         self.lbl_warn.setText(f"⚠ Exportado visible CSV: {out_path}")
 
+    def _switch_view(self, view: str):
+        self.view = view
+        self.refresh(force=True)
+
+    def _toggle_pause(self):
+        self.paused = not self.paused
+        self.btn_pause.setText(f"PAUSA: {'ON' if self.paused else 'OFF'}")
+        self.refresh(force=True)
+
+    def _reset_view(self):
+        self.p_main.enableAutoRange(); self.p_min.enableAutoRange(); self.p_hour.enableAutoRange(); self.p_day.enableAutoRange()
+        self.follow_latest = True
+        self.btn_freeze.setText("FREEZE VIEW: OFF")
+
+    def _toggle_freeze(self):
+        self.follow_latest = not self.follow_latest
+        self.btn_freeze.setText(f"FREEZE VIEW: {'OFF' if self.follow_latest else 'ON'}")
+
+    def _toggle_rule_mode(self):
+        self.rule_enabled = not self.rule_enabled
+        if not self.rule_enabled:
+            self.rule_points = []
+        self.btn_rule.setText(f"REGLA: {'ON' if self.rule_enabled else 'OFF'}")
+
+    def _toggle_markers(self):
+        self.markers_enabled = not self.markers_enabled
+        self.btn_markers.setText(f"MARCADORES: {'ON' if self.markers_enabled else 'OFF'}")
+
+    def _init_crosshair(self):
+        self.cross_v = pg.InfiniteLine(angle=90, movable=False, pen=pg.mkPen("#6688aa88"))
+        self.cross_h = pg.InfiniteLine(angle=0, movable=False, pen=pg.mkPen("#6688aa88"))
+        self.p_main.addItem(self.cross_v, ignoreBounds=True)
+        self.p_main.addItem(self.cross_h, ignoreBounds=True)
+        self.main_curve_proxy = pg.SignalProxy(self.p_main.scene().sigMouseMoved, rateLimit=45, slot=self._on_mouse_moved)
+        self.main_click_proxy = pg.SignalProxy(self.p_main.scene().sigMouseClicked, rateLimit=20, slot=self._on_mouse_clicked)
+
+    def _on_mouse_moved(self, evt):
+        if not evt:
+            return
+        pos = evt[0]
+        if not self.p_main.sceneBoundingRect().contains(pos):
+            return
+        point = self.p_main.vb.mapSceneToView(pos)
+        x, y = float(point.x()), float(point.y())
+        self.cross_v.setPos(x); self.cross_h.setPos(y)
+        main_vis = _sanitize_series_for_plot(self._last_plot_series.get("main", pd.DataFrame(columns=["timestamp", "equity"])))
+        if main_vis.empty:
+            return
+        ts = datetime.fromtimestamp(x, tz=timezone.utc).astimezone(DISPLAY_TZ)
+        first = float(main_vis["equity"].iloc[0])
+        delta = y - first
+        pct = (delta / first * 100.0) if abs(first) > 1e-12 else 0.0
+        self.p_main.setToolTip(
+            f"{ts.strftime('%Y-%m-%d %H:%M:%S %Z')}\n"
+            f"Saldo: {y:,.2f} USD\n"
+            f"Δ vs primer visible: {delta:+,.2f} USD ({pct:+.2f}%)"
+        )
+
+    def _on_mouse_clicked(self, evt):
+        if not evt or not self.rule_enabled:
+            return
+        mouse_event = evt[0]
+        if mouse_event.button() != QtCore.Qt.LeftButton:
+            return
+        scene_pos = mouse_event.scenePos()
+        if not self.p_main.sceneBoundingRect().contains(scene_pos):
+            return
+        point = self.p_main.vb.mapSceneToView(scene_pos)
+        self.rule_points.append((float(point.x()), float(point.y())))
+        if len(self.rule_points) > 2:
+            self.rule_points = self.rule_points[-2:]
+        if len(self.rule_points) == 2:
+            self._render_rule_stats()
+
+    def _render_rule_stats(self):
+        (x1, y1), (x2, y2) = self.rule_points
+        dt_s = max(0.0, x2 - x1)
+        delta = y2 - y1
+        pct = (delta / y1 * 100.0) if abs(y1) > 1e-12 else 0.0
+        usd_min = (delta / (dt_s / 60.0)) if dt_s > 0 else 0.0
+        pct_hour = (pct / (dt_s / 3600.0)) if dt_s > 0 else 0.0
+        self.lbl_stats.setText(
+            f"REGLA A→B | ΔUSD={delta:+,.2f} | Δ%={pct:+.2f}% | Δt={dt_s/60.0:,.1f} min | Pend={usd_min:+,.2f} USD/min | {pct_hour:+.2f}%/h"
+        )
+
+    def _export_visible_csv(self):
+        vis = _sanitize_series_for_plot(self._last_plot_series.get("main", pd.DataFrame(columns=["timestamp", "equity"])))
+        if vis.empty:
+            self.lbl_warn.setText("⚠ Exportación omitida: no hay serie visible")
+            return
+        now_tag = datetime.now().strftime("%Y%m%d_%H%M%S")
+        out_path = self.engine.base_dir / f"monitor_visible_export_{self.view.lower()}_{now_tag}.csv"
+        src = (self.last_good_source or "--")
+        exp = vis.copy()
+        exp["source"] = src
+        exp["view"] = self.view
+        exp["window_tag"] = "visible_main"
+        exp.to_csv(out_path, index=False, columns=["timestamp", "equity", "source", "view", "window_tag"])
+        self.lbl_warn.setText(f"⚠ Exportado visible CSV: {out_path}")
+
     def keyPressEvent(self, ev: QtGui.QKeyEvent):
         k = ev.key()
         if k == QtCore.Qt.Key_1:
@@ -1067,6 +1191,34 @@ class DashboardWindow(QtWidgets.QMainWindow):
             interval = REFRESH_SEGUNDOS_MINIMIZADO if self.isMinimized() else REFRESH_SEGUNDOS
             self.timer.setInterval(int(interval * 1000))
         super().changeEvent(ev)
+
+    def _is_snapshot_valid(self, snap: Snapshot) -> bool:
+        return (
+            _is_valid_number(snap.saldo_actual)
+            or (snap.series_real is not None and not snap.series_real.empty)
+            or (snap.series_main is not None and not snap.series_main.empty)
+        )
+
+    def _update_last_good(self, snap: Snapshot):
+        if not self._is_snapshot_valid(snap):
+            return
+        self.last_good_snapshot = snap
+        if _is_valid_number(snap.saldo_actual):
+            self.last_good_saldo = float(snap.saldo_actual)
+        if snap.source:
+            self.last_good_source = snap.source
+        if snap.last_update is not None:
+            self.last_good_last_update = snap.last_update
+
+    def _throttled_warn(self, key: str, msg: str, cooldown_s: float = 20.0):
+        now_mono = time.monotonic()
+        prev = self._error_throttle.get(key, (0.0, 0))
+        last_ts, count = prev
+        count += 1
+        self._error_throttle[key] = (now_mono, count)
+        if (now_mono - last_ts) >= cooldown_s:
+            print(f"[MONITOR][WARN] {msg} (x{count})")
+            self._error_throttle[key] = (now_mono, 0)
 
     def _is_snapshot_valid(self, snap: Snapshot) -> bool:
         return (

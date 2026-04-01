@@ -654,6 +654,15 @@ OVERRIDE_REZAGADA_ENABLE = True
 OVERRIDE_REZAGADA_MIN_VALID = 5
 OVERRIDE_REZAGADA_GREENS_OK = (4, 5)
 OVERRIDE_REZAGADA_REDS_OK = (1, 2)
+# === LXV time-align (solo vista derivada para matriz LXV; NO toca estado base) ===
+LXV_TIME_ALIGN_ENABLE = True
+LXV_ALIGN_WINDOW_S = 75.0
+LXV_ALIGN_FREEZE_S = 20.0
+LXV_ALIGN_USE_CLOSE_ONLY = True
+LXV_ALIGN_REQUIRE_SAME_ASSET = True
+LXV_ALIGN_MAX_COLS = 40
+LXV_ALIGN_DEBUG = False
+LXV_ALIGN_LOG_COOLDOWN_S = 25.0
 EMBUDO_MAIN_BLOCK_ON_MODE_C_PENDING = True
 EMBUDO_MAIN_REQUIRE_TRIGGER_OR_CONTEXT = True
 IA_PROB_POLARIZE_ENABLE = True
@@ -1410,6 +1419,11 @@ LAST_REAL_CLOSE_SIG = {bot: None for bot in BOT_NAMES}  # evita procesar el mism
 CTT_CLOSE_EVENTS = deque(maxlen=6000)
 CTT_CLOSE_SEEN = set()
 HUD_CLOSE_LOG_TS = {}
+LXV_ALIGN_STATE = {
+    "cols": deque(maxlen=max(40, int(LXV_ALIGN_MAX_COLS))),
+    "seen": set(),
+    "last_log_ts": {},
+}
 CTT_STATE = {
     "status": "NEUTRAL",
     "regime": "NEUTRAL",
@@ -12112,6 +12126,139 @@ def _resultado_to_mark(x):
         return "R"
     return None
 
+
+def _lxv_align_log(evento: str, detalle: str = ""):
+    try:
+        if (not LXV_ALIGN_DEBUG) and str(evento) not in {"fallback_actual"}:
+            return
+        now = float(time.time())
+        st = LXV_ALIGN_STATE.setdefault("last_log_ts", {})
+        key = f"{evento}:{detalle[:40]}"
+        last = float(st.get(key, 0.0) or 0.0)
+        if (now - last) < float(LXV_ALIGN_LOG_COOLDOWN_S):
+            return
+        st[key] = now
+        msg = f"LXV_ALIGN: {evento}" + (f" | {detalle}" if detalle else "")
+        agregar_evento(msg)
+    except Exception:
+        return
+
+
+def _lxv_build_time_aligned_board(bots: list[str], window: int = 40) -> list[dict]:
+    """
+    Vista derivada para LXV (NO muta estado_bots[*]['resultados']).
+    Consume cierres válidos de CTT_CLOSE_EVENTS y alinea por frente temporal.
+    """
+    if not bool(LXV_TIME_ALIGN_ENABLE):
+        raise RuntimeError("lxv_align_disabled")
+
+    state = LXV_ALIGN_STATE if isinstance(LXV_ALIGN_STATE, dict) else {}
+    cols_deque = state.setdefault("cols", deque(maxlen=max(40, int(LXV_ALIGN_MAX_COLS))))
+    seen = state.setdefault("seen", set())
+    bot_set = {str(b) for b in list(bots or [])}
+    if not bot_set:
+        return []
+
+    try:
+        eventos = list(CTT_CLOSE_EVENTS)
+        if not eventos:
+            return []
+        now = float(time.time())
+        for col in list(cols_deque):
+            try:
+                if (not bool(col.get("frozen"))) and (now - float(col.get("t_front", 0.0) or 0.0) > float(LXV_ALIGN_FREEZE_S)):
+                    col["frozen"] = True
+                    _lxv_align_log("columna_congelada", f"t_front={float(col.get('t_front', 0.0) or 0.0):.1f}")
+            except Exception:
+                continue
+
+        for ev in eventos:
+            sig = str((ev or {}).get("sig") or "")
+            if (not sig) or (sig in seen):
+                continue
+            seen.add(sig)
+            bot = str((ev or {}).get("bot") or "")
+            if bot not in bot_set:
+                continue
+            raw_result = (ev or {}).get("result")
+            mark = "G" if int(raw_result) == 1 else ("R" if int(raw_result) == 0 else None)
+            if mark not in {"G", "R"}:
+                continue
+            ts = _to_epoch_ctt((ev or {}).get("ts"))
+            if not isinstance(ts, (int, float)) or float(ts) <= 0:
+                ts = float(time.time())
+            ts = float(ts)
+            asset = str((ev or {}).get("asset") or "").strip().upper()
+
+            active = cols_deque[-1] if len(cols_deque) else None
+            if active is not None:
+                try:
+                    if (not bool(active.get("frozen"))) and ((ts - float(active.get("t_front", 0.0) or 0.0)) > float(LXV_ALIGN_FREEZE_S)):
+                        active["frozen"] = True
+                        _lxv_align_log("columna_congelada", f"t_front={float(active.get('t_front', 0.0) or 0.0):.1f}")
+                except Exception:
+                    pass
+
+            can_join_active = False
+            if active is not None and not bool(active.get("frozen")):
+                t_front = float(active.get("t_front", 0.0) or 0.0)
+                dt = abs(ts - t_front)
+                same_asset_ok = True
+                if bool(LXV_ALIGN_REQUIRE_SAME_ASSET):
+                    a0 = str(active.get("asset") or "").strip().upper()
+                    same_asset_ok = (not a0) or (not asset) or (a0 == asset)
+                if dt <= float(LXV_ALIGN_WINDOW_S) and same_asset_ok:
+                    can_join_active = True
+
+            if can_join_active:
+                cells = active.setdefault("cells", {})
+                if bot not in cells:
+                    cells[bot] = mark
+                    if ts < float(active.get("t_front", 0.0) or 0.0):
+                        _lxv_align_log("rezagado_misma_columna", f"bot={bot}")
+            else:
+                if active is not None:
+                    try:
+                        t_front = float(active.get("t_front", 0.0) or 0.0)
+                        if ts <= (t_front + float(LXV_ALIGN_WINDOW_S)) and bool(active.get("frozen")):
+                            _lxv_align_log("fuera_de_ventana", f"bot={bot}")
+                            continue
+                    except Exception:
+                        pass
+                col_new = {"t_front": ts, "asset": asset, "cells": {bot: mark}, "frozen": False}
+                cols_deque.append(col_new)
+                _lxv_align_log("nueva_columna", f"bot={bot}")
+
+        cols = list(cols_deque)[-max(1, int(window)):]
+        cols = list(reversed(cols))
+        out = []
+        for off, c in enumerate(cols):
+            cells_src = dict((c or {}).get("cells", {}) or {})
+            cells = {}
+            validos = verdes = rojos = 0
+            for b in list(bots or []):
+                m = cells_src.get(str(b))
+                cells[str(b)] = m if m in {"G", "R"} else None
+                if m == "G":
+                    validos += 1; verdes += 1
+                elif m == "R":
+                    validos += 1; rojos += 1
+            ratio = (float(verdes) / float(validos)) if validos > 0 else None
+            out.append({
+                "offset": int(off),
+                "cells": cells,
+                "total_validos": int(validos),
+                "total_verdes": int(verdes),
+                "total_rojos": int(rojos),
+                "green_ratio": ratio,
+                "t_front": float((c or {}).get("t_front", 0.0) or 0.0),
+            })
+        _lxv_align_log("columnas=N", str(len(out)))
+        return out
+    except Exception as exc:
+        _lxv_align_log("fallback_actual", str(exc))
+        raise
+
 def _construir_matriz_resultados_columnas(estado: dict, bots: list[str], window: int = 40) -> list[dict]:
     """
     Construye matriz por columnas cerradas:
@@ -15017,7 +15164,10 @@ def _resolver_logica_unica_real(candidatos: list, estado: dict, bot_names: list[
     }
     try:
         bots = list(bot_names or [])
-        cols = _construir_matriz_resultados_columnas(estado if isinstance(estado, dict) else {}, bots, window=40)
+        try:
+            cols = _lxv_build_time_aligned_board(bots, window=40)
+        except Exception:
+            cols = _construir_matriz_resultados_columnas(estado if isinstance(estado, dict) else {}, bots, window=40)
         if not cols:
             out["reason"] = "estructura_insuficiente"
             return out
