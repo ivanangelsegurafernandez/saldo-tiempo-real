@@ -695,6 +695,7 @@ class DashboardWindow(QtWidgets.QMainWindow):
         self._worker_thread: Optional[QtCore.QThread] = None
         self._worker_busy = False
         self._render_signature = None
+        self._last_good_snapshot: Optional[Snapshot] = None
         self._last_metrics: Dict[str, object] = {}
         self._rule_last_emit: Dict[str, float] = {}
         self.snapshot_build_ms = 0.0
@@ -1096,19 +1097,29 @@ class DashboardWindow(QtWidgets.QMainWindow):
         self._worker_busy = False
         self.snapshot_build_ms = float(build_ms)
         self.last_worker_finished_ts = float(finished_ts)
+        self._last_good_snapshot = snap
         t0 = time.perf_counter()
+        signature = None
+        refresh_state = "PAUSADO" if self.paused else "ACTIVO"
+        self.lbl_refresh.setText(f"REFRESCO: {refresh_state}")
         try:
             signature = self._snapshot_signature(snap)
-            refresh_state = "PAUSADO" if self.paused else "ACTIVO"
-            self.lbl_refresh.setText(f"REFRESCO: {refresh_state}")
             last = snap.last_update.astimezone(DISPLAY_TZ).strftime("%Y-%m-%d %H:%M:%S %Z") if snap.last_update else "--"
             self.lbl_last.setText(f"ÚLTIMA ACT: {last}")
             if signature == self._render_signature:
                 self.lbl_state.setText("STATE: IDLE")
                 return
             self._render_signature = signature
-            self.lbl_state.setText("STATE: DEGRADED" if self.degraded_mode_active else "STATE: LIVE")
+        except Exception:
+            snap.warnings.append("render prep error")
+            traceback.print_exc()
 
+        main_scale = "--"
+        main_y0, main_y1 = 0.0, 0.0
+        visible = pd.DataFrame(columns=["timestamp", "equity"])
+
+        # FASE 2 — Header crítico
+        try:
             self.lbl_big.setText(_fmt_money(snap.saldo_actual))
             src = snap.source.upper().strip()
             self.lbl_source.setText(f"FUENTE: {src}")
@@ -1124,9 +1135,23 @@ class DashboardWindow(QtWidgets.QMainWindow):
                 self.lbl_source.setObjectName("BadgeBad"); self.lbl_big.setStyleSheet("color:#ffb9b9;")
             else:
                 self.lbl_source.setObjectName("BadgeNeutral"); self.lbl_big.setStyleSheet("color:#d8e7ff;")
+            visible = _sanitize_series_for_plot(snap.series_main)
+            n_visible = int(len(visible))
+            if n_visible >= 1:
+                first = float(visible["equity"].iloc[0]); last_v = float(visible["equity"].iloc[-1])
+                delta = last_v - first
+                pct = (delta / first * 100.0) if abs(first) > 1e-12 else 0.0
+                self.lbl_delta.setText(f"Δ VIS: {delta:+,.2f} USD ({pct:+.2f}%)")
+            else:
+                self.lbl_delta.setText("Δ VIS: --")
+            self.lbl_samples.setText(f"MUESTRAS: {n_visible}")
+            self.lbl_state.setText("STATE: DEGRADED" if self.degraded_mode_active else "STATE: LIVE")
+        except Exception:
+            snap.warnings.append("header render error")
+            traceback.print_exc()
 
-            main_scale = "--"
-            main_y0, main_y1 = 0.0, 0.0
+        # FASE 3 — Plots
+        try:
             panel_items = [("main", snap.series_main)]
             if not self.degraded_mode_active:
                 panel_items.extend([("min", snap.series_minutes), ("hour", snap.series_hours), ("day", snap.series_days)])
@@ -1138,24 +1163,25 @@ class DashboardWindow(QtWidgets.QMainWindow):
                         main_y0, main_y1 = py0, py1
                 except Exception as plot_err:
                     snap.warnings.append(f"plot {key} con error: {plot_err}")
-
-            visible = _sanitize_series_for_plot(snap.series_main)
-            n_visible = int(len(visible))
-            if n_visible >= 1:
-                first = float(visible["equity"].iloc[0]); last_v = float(visible["equity"].iloc[-1])
-                delta = last_v - first
-                pct = (delta / first * 100.0) if abs(first) > 1e-12 else 0.0
-                self.lbl_delta.setText(f"Δ VIS: {delta:+,.2f} USD ({pct:+.2f}%)")
-            else:
-                self.lbl_delta.setText("Δ VIS: --")
-            self.lbl_samples.setText(f"MUESTRAS: {n_visible}")
             self.lbl_scale.setText(f"ESCALA Y: {main_scale}")
+        except Exception:
+            snap.warnings.append("plot phase error")
+            traceback.print_exc()
 
+        # FASE 4 — Métricas live (secundarias)
+        try:
             metrics = self._compute_live_metrics(visible, snap)
             rule = self._evaluate_live_rules(metrics, snap)
             self.lbl_live_metrics.setText(str(metrics.get("text", "LIVE: --")))
             self.lbl_rule.setText(f"RULE: {rule}")
+        except Exception:
+            self.lbl_live_metrics.setText("LIVE: --")
+            self.lbl_rule.setText("RULE: --")
+            snap.warnings.append("live metrics error")
+            traceback.print_exc()
 
+        # FASE 5 — Warnings / tooltip / perf
+        try:
             self.render_ms = (time.perf_counter() - t0) * 1000.0
             if self.snapshot_build_ms >= DEGRADED_WORKER_MS or self.render_ms >= DEGRADED_RENDER_MS:
                 if not self.degraded_mode_active:
@@ -1163,7 +1189,6 @@ class DashboardWindow(QtWidgets.QMainWindow):
                 self.degraded_mode_active = True
             elif self.consecutive_errors <= 0:
                 self.degraded_mode_active = False
-
             perf_diag = (
                 f"worker_busy={self._worker_busy} skipped={self.skipped_refresh_count} "
                 f"build_ms={self.snapshot_build_ms:,.1f} render_ms={self.render_ms:,.1f} "
@@ -1177,13 +1202,7 @@ class DashboardWindow(QtWidgets.QMainWindow):
                 self.lbl_warn.setText("")
                 self.lbl_warn.setToolTip(perf_diag + f"\nEscala main: {Y_SCALE_MODE} | y=[{main_y0:,.2f}, {main_y1:,.2f}]")
             self.consecutive_errors = 0
-        except Exception as e:
-            self.last_error_ts = time.time()
-            self.consecutive_errors += 1
-            if self.consecutive_errors >= DEGRADED_ERRORS_THRESHOLD:
-                self.degraded_mode_active = True
-            self.lbl_state.setText("STATE: ERROR")
-            self.lbl_warn.setText(f"⚠ Error monitor: {e}")
+        except Exception:
             traceback.print_exc()
 
     @QtCore.Slot(str)
@@ -1194,7 +1213,7 @@ class DashboardWindow(QtWidgets.QMainWindow):
         if self.consecutive_errors >= DEGRADED_ERRORS_THRESHOLD:
             self.degraded_mode_active = True
         self.lbl_state.setText("STATE: ERROR")
-        self.lbl_warn.setText("⚠ Error en worker snapshot")
+        self.lbl_warn.setText("⚠ Error en worker snapshot (se conserva último snapshot)")
         self.lbl_warn.setToolTip(tb_text[-2000:])
         print(tb_text)
 
