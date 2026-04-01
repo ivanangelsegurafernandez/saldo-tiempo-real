@@ -8,8 +8,9 @@ Dependencias:
 Lectura de datos (prioridad REAL):
 1) saldo_real_live_history.jsonl (ruta compartida)
 2) saldo_real_live.json (snapshot maestro)
-3) LOG_SALDOS / *.log / *.txt (observado)
-4) registro_enriquecido_fulll*.csv (auxiliar)
+3) saldo_real_series.csv (fallback real)
+4) LOG_SALDOS / *.log / *.txt (observado)
+5) registro_enriquecido_fulll*.csv (auxiliar)
 """
 
 from __future__ import annotations
@@ -19,6 +20,7 @@ import json
 import os
 import re
 import sys
+import time
 import traceback
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -64,6 +66,7 @@ SALDO_LIVE_FILE = "saldo_real_live.json"
 SALDO_LIVE_HISTORY_FILE = "saldo_real_live_history.jsonl"
 SALDO_SERIES_CSV_FILE = "saldo_real_series.csv"
 DISPLAY_TIMEZONE = "America/Lima"
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 SALDO_LIVE_SHARED_PATH = os.path.abspath(
     os.getenv("SALDO_LIVE_SHARED_PATH", os.path.join(os.path.expanduser("~"), SALDO_LIVE_FILE))
 )
@@ -73,6 +76,13 @@ SALDO_LIVE_HISTORY_SHARED_PATH = os.path.abspath(
         os.path.join(os.path.dirname(SALDO_LIVE_SHARED_PATH), SALDO_LIVE_HISTORY_FILE),
     )
 )
+def resolver_ruta_saldo_series() -> str:
+    custom = os.getenv("SALDO_SERIES_CSV_PATH", "").strip()
+    if custom:
+        return os.path.abspath(os.path.expanduser(custom))
+    return os.path.abspath(os.path.join(SCRIPT_DIR, SALDO_SERIES_CSV_FILE))
+
+SALDO_SERIES_CSV_PATH = resolver_ruta_saldo_series()
 SALDO_LIVE_PATH = os.getenv("SALDO_LIVE_PATH", "").strip()
 
 MONITOR_VERSION = "v2026.03.31-r1"
@@ -80,15 +90,26 @@ MONITOR_BUILD_ID = "MONITOR_SALDO_PRO_REAL_SERIES_GUARD"
 MIN_POINTS_FOR_LINE = 2
 SHOW_LAST_MARKER = True
 SHOW_EXTREME_MARKERS = False
-Y_SCALE_MODE = os.getenv("Y_SCALE_MODE", "capital").strip().lower()  # capital | manual | auto
+GLOW_ENABLED = False
+PLOT_DOWNSAMPLE_THRESHOLD = 1800
+RANGE_EPSILON = 1e-4
+Y_SCALE_MODE = os.getenv("Y_SCALE_MODE", "auto").strip().lower()  # capital | manual | auto
 Y_AXIS_MIN_USD = float(os.getenv("Y_AXIS_MIN_USD", "0"))
 Y_AXIS_MAX_USD = float(os.getenv("Y_AXIS_MAX_USD", "300"))
 Y_AUTO_SPAN_USD = float(os.getenv("Y_AUTO_SPAN_USD", "120"))
 CAPITAL_BASE_USD = float(os.getenv("CAPITAL_BASE_USD", "0") or "0")
 MIN_X_SPAN_SECONDS = 20.0
-DISPLAY_TZ = ZoneInfo(DISPLAY_TIMEZONE)
-
-
+WORKER_WARN_SECONDS = 2.5
+DEGRADED_ERRORS_THRESHOLD = 4
+DEGRADED_RENDER_MS = 220.0
+DEGRADED_WORKER_MS = 1500.0
+RULE_FLATLINE_S = 90.0
+RULE_DROP_FAST_PCT = 8.0
+RULE_REBOUND_PCT = 4.0
+RULE_STALE_S = 90.0
+RULE_VOL_HIGH_THR = 1.25
+RULE_NARROW_RANGE_USD = 1.0
+RULE_ALERT_COOLDOWN_S = 25.0
 def _safe_display_tz():
     if ZoneInfo is None:
         return timezone.utc
@@ -241,6 +262,26 @@ class Snapshot:
     view: str
 
 
+class SnapshotWorker(QtCore.QObject):
+    finished = QtCore.Signal(object, float, float, str)
+    failed = QtCore.Signal(str)
+
+    def __init__(self, engine: "DataEngine", view: str):
+        super().__init__()
+        self.engine = engine
+        self.view = view
+
+    @QtCore.Slot()
+    def run(self):
+        t0 = time.perf_counter()
+        try:
+            snap = self.engine.build_snapshot(self.view)
+            t1 = time.perf_counter()
+            self.finished.emit(snap, (t1 - t0) * 1000.0, time.time(), self.view)
+        except Exception:
+            self.failed.emit(traceback.format_exc())
+
+
 class DataEngine:
     def __init__(self, base_dir: Path):
         self.base_dir = base_dir
@@ -264,8 +305,6 @@ class DataEngine:
         if SALDO_LIVE_PATH:
             custom = Path(SALDO_LIVE_PATH).expanduser()
             cands.append(custom / SALDO_LIVE_FILE if custom.is_dir() else custom)
-        cands.append(self.base_dir / SALDO_LIVE_FILE)
-        cands.append(Path.cwd() / SALDO_LIVE_FILE)
         out: List[Path] = []
         seen = set()
         for p in cands:
@@ -289,12 +328,9 @@ class DataEngine:
         return out
 
     def _master_series_candidates(self) -> List[Path]:
-        base = Path(SALDO_LIVE_SHARED_PATH).expanduser().parent
-        cands: List[Path] = [Path(os.getenv("SALDO_SERIES_CSV_PATH", str(base / SALDO_SERIES_CSV_FILE))).expanduser()]
+        cands: List[Path] = [Path(SALDO_SERIES_CSV_PATH).expanduser()]
         for p in self._master_live_candidates():
             cands.append(p.parent / SALDO_SERIES_CSV_FILE)
-        cands.append(self.base_dir / SALDO_SERIES_CSV_FILE)
-        cands.append(Path.cwd() / SALDO_SERIES_CSV_FILE)
         out: List[Path] = []
         seen = set()
         for p in cands:
@@ -385,7 +421,7 @@ class DataEngine:
             (pd.DataFrame(columns=["timestamp", "equity"]), f"Sin histórico real: no se encontró {SALDO_LIVE_HISTORY_FILE} en ruta compartida: {SALDO_LIVE_HISTORY_SHARED_PATH}", None, None),
         )
 
-    def _read_master_series(self) -> Tuple[pd.DataFrame, Optional[str], Optional[Path]]:
+    def _read_saldo_series_csv(self) -> Tuple[pd.DataFrame, Optional[str], Optional[Path]]:
         paths = self._master_series_candidates()
         sig = self._sig(paths)
         cached = self._cached("series_csv", sig)
@@ -540,7 +576,7 @@ class DataEngine:
 
         master, master_msg, live_path_used = self._read_master_live() if view == "REAL" else (None, None, None)
         hist, hist_msg, hist_path_used, hist_growth_msg = self._read_master_history() if view == "REAL" else (pd.DataFrame(columns=["timestamp", "equity"]), None, None, None)
-        series_csv, series_msg, series_path_used = self._read_master_series() if view == "REAL" else (pd.DataFrame(columns=["timestamp", "equity"]), None, None)
+        series_csv, series_msg, series_path_used = self._read_saldo_series_csv() if view == "REAL" else (pd.DataFrame(columns=["timestamp", "equity"]), None, None)
         observed = self._parse_observed(view)
         estimated = self._build_estimated(view)
 
@@ -550,7 +586,6 @@ class DataEngine:
             warnings.append(hist_msg)
 
         if view == "REAL":
-            self._validate_balance_csvs(warnings)
             warnings.append(f"Monitor {MONITOR_VERSION} · id={MONITOR_BUILD_ID}")
             warnings.append(f"Ruta snapshot real: {live_path_used if live_path_used else SALDO_LIVE_SHARED_PATH}")
             warnings.append(f"Ruta histórico real: {hist_path_used if hist_path_used else SALDO_LIVE_HISTORY_SHARED_PATH}")
@@ -657,6 +692,21 @@ class DashboardWindow(QtWidgets.QMainWindow):
         self.engine = engine
         self.view = CUENTA_OBJETIVO if CUENTA_OBJETIVO in ("REAL", "DEMO", "ALL") else "REAL"
         self.paused = False
+        self._worker_thread: Optional[QtCore.QThread] = None
+        self._worker_busy = False
+        self._render_signature = None
+        self._last_good_snapshot: Optional[Snapshot] = None
+        self._last_metrics: Dict[str, object] = {}
+        self._rule_last_emit: Dict[str, float] = {}
+        self.snapshot_build_ms = 0.0
+        self.render_ms = 0.0
+        self.last_worker_started_ts = 0.0
+        self.last_worker_finished_ts = 0.0
+        self.skipped_refresh_count = 0
+        self.last_error_ts = 0.0
+        self.consecutive_errors = 0
+        self.degraded_mode_active = False
+        self.degraded_activations = 0
         self.setWindowTitle(f"Monitor Saldo Real Deriv {MONITOR_VERSION}")
         self.resize(1600, 900)
 
@@ -688,14 +738,21 @@ class DashboardWindow(QtWidgets.QMainWindow):
         self.lbl_tz = QtWidgets.QLabel(f"TZ: {DISPLAY_TIMEZONE}"); self.lbl_tz.setObjectName("MetaBox")
         self.lbl_now = QtWidgets.QLabel("HORA LOCAL: --"); self.lbl_now.setObjectName("MetaNow")
         self.lbl_last = QtWidgets.QLabel("ÚLTIMA ACT: --"); self.lbl_last.setObjectName("MetaLast")
+        self.lbl_state = QtWidgets.QLabel("STATE: IDLE"); self.lbl_state.setObjectName("MetaBox")
+        self.lbl_rule = QtWidgets.QLabel("RULE: --"); self.lbl_rule.setObjectName("MetaBox")
         meta.addWidget(self.lbl_refresh)
         meta.addWidget(self.lbl_scale)
         meta.addWidget(self.lbl_delta)
         meta.addWidget(self.lbl_samples)
         meta.addWidget(self.lbl_tz)
+        meta.addWidget(self.lbl_state)
+        meta.addWidget(self.lbl_rule)
         meta.addWidget(self.lbl_now, 1)
         meta.addWidget(self.lbl_last)
         hl.addLayout(meta)
+
+        self.lbl_live_metrics = QtWidgets.QLabel("LIVE: --"); self.lbl_live_metrics.setObjectName("Help")
+        hl.addWidget(self.lbl_live_metrics)
         root.addWidget(header)
 
         self.graphics = pg.GraphicsLayoutWidget(); root.addWidget(self.graphics, 1)
@@ -739,7 +796,7 @@ class DashboardWindow(QtWidgets.QMainWindow):
             #Help { font-size: 9px; color: #6b84a6; }
             """
         )
-        pg.setConfigOptions(antialias=True, background="#0b0f14", foreground="#d9e2f2")
+        pg.setConfigOptions(antialias=False, background="#0b0f14", foreground="#d9e2f2")
 
         self.timer = QtCore.QTimer(self)
         self.timer.timeout.connect(self.refresh)
@@ -760,6 +817,117 @@ class DashboardWindow(QtWidgets.QMainWindow):
         plot.setYRange(y0, y1, padding=0.0)
         plot.setLimits(yMin=y0, yMax=y1)
 
+    def _snapshot_signature(self, snap: Snapshot) -> Tuple:
+        s = _sanitize_series_for_plot(snap.series_main)
+        last_ts = s["timestamp"].iloc[-1] if not s.empty else None
+        last_eq = float(s["equity"].iloc[-1]) if not s.empty else None
+        return (
+            str(snap.source),
+            None if snap.saldo_actual is None else round(float(snap.saldo_actual), 8),
+            snap.last_update.isoformat() if isinstance(snap.last_update, datetime) else None,
+            int(len(s)),
+            last_ts.isoformat() if last_ts is not None else None,
+            None if last_eq is None else round(last_eq, 8),
+            int(len(snap.series_minutes)),
+            int(len(snap.series_hours)),
+            int(len(snap.series_days)),
+        )
+
+    def _compute_live_metrics(self, visible: pd.DataFrame, snap: Snapshot) -> Dict[str, object]:
+        m: Dict[str, object] = {"text": "LIVE: --", "rule": "--"}
+        if visible.empty:
+            return m
+        y = visible["equity"].to_numpy(dtype=float)
+        x = (visible["timestamp"].astype("int64") / 1e9).to_numpy(dtype=float)
+        peak = float(np.nanmax(y)); floor = float(np.nanmin(y))
+        last_v = float(y[-1]); range_v = peak - floor
+        dd_usd = last_v - peak
+        dd_pct = (dd_usd / peak * 100.0) if abs(peak) > 1e-12 else 0.0
+        speed = np.nan
+        slope = np.nan
+        vol = np.nan
+        age_change = np.nan
+        if len(y) >= 2:
+            dtm = max(1e-9, (x[-1] - x[-2]) / 60.0)
+            speed = (y[-1] - y[-2]) / dtm
+            last_change_idx = np.where(np.abs(np.diff(y)) > 1e-9)[0]
+            if len(last_change_idx) > 0:
+                age_change = max(0.0, x[-1] - x[last_change_idx[-1] + 1])
+            dx = (x - x[0]) / 60.0
+            if len(y) >= 3 and float(dx[-1]) > 0:
+                slope = float(np.polyfit(dx, y, 1)[0])
+            diffs = np.diff(y)
+            if len(diffs) >= 2:
+                vol = float(np.nanstd(diffs))
+        dist_peak_usd = peak - last_v
+        dist_peak_pct = (dist_peak_usd / peak * 100.0) if abs(peak) > 1e-12 else 0.0
+        m.update(
+            {
+                "peak": peak, "floor": floor, "range": range_v,
+                "drawdown_usd": dd_usd, "drawdown_pct": dd_pct,
+                "speed": speed, "slope": slope, "vol": vol,
+                "dist_peak_usd": dist_peak_usd, "dist_peak_pct": dist_peak_pct,
+                "age_last_change_s": age_change,
+                "text": (
+                    f"LIVE | peak={peak:,.2f} floor={floor:,.2f} dd={dd_usd:,.2f} ({dd_pct:+.2f}%) "
+                    f"rng={range_v:,.2f} spd={speed if np.isfinite(speed) else float('nan'):+.3f}/min "
+                    f"slope={slope if np.isfinite(slope) else float('nan'):+.3f} vol={vol if np.isfinite(vol) else float('nan'):.3f}"
+                ),
+            }
+        )
+        return m
+
+    def _evaluate_live_rules(self, metrics: Dict[str, object], snap: Snapshot) -> str:
+        now = time.time()
+        alerts: List[str] = []
+        age_change = metrics.get("age_last_change_s", np.nan)
+        drawdown_pct = abs(float(metrics.get("drawdown_pct", 0.0) or 0.0))
+        speed = float(metrics.get("speed", np.nan))
+        vol = float(metrics.get("vol", np.nan))
+        range_v = float(metrics.get("range", 0.0) or 0.0)
+        if np.isfinite(age_change) and age_change >= RULE_FLATLINE_S:
+            alerts.append("FLATLINE")
+        if np.isfinite(speed) and speed <= -(RULE_DROP_FAST_PCT / 100.0):
+            alerts.append("DROP_FAST")
+        if np.isfinite(speed) and speed >= (RULE_REBOUND_PCT / 100.0):
+            alerts.append("REBOUND")
+        if drawdown_pct <= 0.05 and range_v > RULE_NARROW_RANGE_USD:
+            alerts.append("NEW_PEAK")
+        if snap.last_update and (snap.now - snap.last_update).total_seconds() > RULE_STALE_S:
+            alerts.append("STALE_SOURCE")
+        if np.isfinite(vol) and vol >= RULE_VOL_HIGH_THR:
+            alerts.append("HIGH_VOL")
+        if range_v <= RULE_NARROW_RANGE_USD:
+            alerts.append("NARROW_RANGE")
+        visible = []
+        for a in alerts:
+            last_emit = float(self._rule_last_emit.get(a, 0.0) or 0.0)
+            if (now - last_emit) >= RULE_ALERT_COOLDOWN_S:
+                self._rule_last_emit[a] = now
+                visible.append(a)
+        if not visible and alerts:
+            visible = alerts[:1]
+        return ", ".join(visible[:3]) if visible else "--"
+
+    def _start_snapshot_worker(self):
+        if self._worker_busy:
+            self.skipped_refresh_count += 1
+            return
+        self._worker_busy = True
+        self.last_worker_started_ts = time.time()
+        thread = QtCore.QThread(self)
+        worker = SnapshotWorker(self.engine, self.view)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.finished.connect(self._on_snapshot_ready)
+        worker.failed.connect(self._on_snapshot_error)
+        worker.finished.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        thread.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        self._worker_thread = thread
+        thread.start()
+
     def _resolve_y_range(self, y: Optional[np.ndarray]) -> Tuple[float, float, str]:
         if Y_SCALE_MODE == "manual":
             ymin = float(min(Y_AXIS_MIN_USD, Y_AXIS_MAX_USD))
@@ -771,7 +939,7 @@ class DashboardWindow(QtWidgets.QMainWindow):
             if CAPITAL_BASE_USD > 0:
                 base = float(CAPITAL_BASE_USD)
             elif y is not None and len(y) > 0:
-                base = float(max(1.0, np.nanmedian(y)))
+                base = float(max(0.01, y[-1]))
             else:
                 base = 10.0
             data_span = 0.0
@@ -784,21 +952,35 @@ class DashboardWindow(QtWidgets.QMainWindow):
         if y is None or len(y) == 0:
             span = float(max(10.0, Y_AUTO_SPAN_USD))
             return 0.0, span, f"auto · span={span:,.2f}"
-        center = float(np.nanmedian(y))
-        span = float(max(10.0, Y_AUTO_SPAN_USD))
-        y0 = max(0.0, center - span * 0.5)
-        y1 = y0 + span
-        return y0, y1, f"auto · span={span:,.2f}"
+        ymin_data = float(np.nanmin(y))
+        ymax_data = float(np.nanmax(y))
+        span = float(max(0.0, ymax_data - ymin_data))
+        if span < 1e-9:
+            pad = max(0.5, abs(ymin_data) * 0.10)
+        else:
+            pad = max(0.25, span * 0.08)
+        y0 = max(0.0, ymin_data - pad)
+        y1 = ymax_data + pad
+        if y1 - y0 < 0.5:
+            y1 = y0 + 0.5
+        return y0, y1, f"auto · data=[{ymin_data:,.2f},{ymax_data:,.2f}]"
 
     def _init_plot_state(self, plot: pg.PlotItem, color: str, endpoint: str, canonical_window_s: int) -> Dict[str, object]:
-        glow = plot.plot([], [], pen=pg.mkPen(color + "55", width=8.0), name=None)
-        line = plot.plot([], [], pen=pg.mkPen(color, width=5.2), name="Equity")
+        glow_width = 2.0 if GLOW_ENABLED else 0.1
+        glow = plot.plot([], [], pen=pg.mkPen(color + "44", width=glow_width), name=None)
+        line = plot.plot([], [], pen=pg.mkPen(color, width=2.0), name="Equity")
+        try:
+            line.setClipToView(True)
+            line.setDownsampling(auto=True, method="peak")
+            line.setSkipFiniteCheck(True)
+        except Exception:
+            pass
         last = plot.plot([], [], pen=None, symbol="o", symbolSize=5, symbolBrush=endpoint, name=None)
         vmax = plot.plot([], [], pen=None, symbol="o", symbolSize=4, symbolBrush="#ffd36b99", name=None)
         vmin = plot.plot([], [], pen=None, symbol="o", symbolSize=4, symbolBrush="#ff8f8f99", name=None)
         txt = pg.TextItem(text="", color="#9ec2ff", anchor=(0, 1))
         plot.addItem(txt)
-        return {"plot": plot, "glow": glow, "line": line, "last": last, "max": vmax, "min": vmin, "text": txt, "canonical_window_s": int(canonical_window_s)}
+        return {"plot": plot, "glow": glow, "line": line, "last": last, "max": vmax, "min": vmin, "text": txt, "canonical_window_s": int(canonical_window_s), "last_range": (None, None), "last_point": None}
 
     def _set_x_range_visible(self, plot: pg.PlotItem, x: np.ndarray, canonical_window_s: int):
         if len(x) == 0:
@@ -841,7 +1023,7 @@ class DashboardWindow(QtWidgets.QMainWindow):
             self.timer.setInterval(int(interval * 1000))
         super().changeEvent(ev)
 
-    def _update_plot_state(self, state: Dict[str, object], s: pd.DataFrame) -> str:
+    def _update_plot_state(self, state: Dict[str, object], s: pd.DataFrame) -> Tuple[str, float, float]:
         plot = state["plot"]
         glow = state["glow"]; line = state["line"]; last = state["last"]; vmax = state["max"]; vmin = state["min"]; txt = state["text"]
         s = _sanitize_series_for_plot(s)
@@ -852,13 +1034,21 @@ class DashboardWindow(QtWidgets.QMainWindow):
             vmax.setData([], [])
             vmin.setData([], [])
             txt.setText("Sin puntos")
-            return "sin datos"
+            y0, y1, scale_info = self._resolve_y_range(None)
+            lr0, lr1 = state.get("last_range", (None, None))
+            if lr0 is None or abs(float(lr0) - y0) > RANGE_EPSILON or abs(float(lr1) - y1) > RANGE_EPSILON:
+                plot.setYRange(y0, y1, padding=0.0)
+                state["last_range"] = (y0, y1)
+            return "sin datos", y0, y1
 
         x = (s["timestamp"].astype("int64") / 1e9).to_numpy(dtype=float)
         y = s["equity"].to_numpy(dtype=float)
 
         if len(x) >= MIN_POINTS_FOR_LINE:
-            glow.setData(x, y)
+            if GLOW_ENABLED:
+                glow.setData(x, y)
+            else:
+                glow.setData([], [])
             line.setData(x, y)
             txt.setText("")
         else:
@@ -879,26 +1069,58 @@ class DashboardWindow(QtWidgets.QMainWindow):
             vmax.setData([], [])
             vmin.setData([], [])
         y0, y1, scale_info = self._resolve_y_range(y)
-        plot.setYRange(y0, y1, padding=0.0)
+        lr0, lr1 = state.get("last_range", (None, None))
+        if lr0 is None or abs(float(lr0) - y0) > RANGE_EPSILON or abs(float(lr1) - y1) > RANGE_EPSILON:
+            plot.setYRange(y0, y1, padding=0.0)
+            state["last_range"] = (y0, y1)
         self._set_x_range_visible(plot, x, int(state["canonical_window_s"]))
-        return scale_info
+        return scale_info, y0, y1
 
     def refresh(self, force: bool = False):
+        self.lbl_now.setText(f"HORA LOCAL: {_now().strftime('%H:%M:%S %Z')}")
         if self.paused and not force:
+            self.lbl_state.setText("STATE: PAUSED")
             return
         if self.isMinimized() and not force:
+            self.lbl_state.setText("STATE: IDLE")
             return
-        try:
-            if not MONITOR_BUILD_ID or MIN_POINTS_FOR_LINE != 2:
-                self.lbl_warn.setText("⚠ Versión desactualizada o incompleta del monitor detectada")
-            snap = self.engine.build_snapshot(self.view)
-            self.lbl_big.setText(_fmt_money(snap.saldo_actual))
-            refresh_state = "PAUSADO" if self.paused else "ACTIVO"
-            last = snap.last_update.astimezone(DISPLAY_TZ).strftime("%Y-%m-%d %H:%M:%S %Z") if snap.last_update else "--"
-            self.lbl_refresh.setText(f"REFRESCO: {refresh_state}")
-            self.lbl_now.setText(f"HORA LOCAL: {snap.now.strftime('%H:%M:%S %Z')}")
-            self.lbl_last.setText(f"ÚLTIMA ACT: {last}")
+        if self._worker_busy:
+            self.skipped_refresh_count += 1
+            self.lbl_state.setText("STATE: LIVE (busy)")
+            return
+        target_interval = REFRESH_SEGUNDOS_MINIMIZADO if self.degraded_mode_active else REFRESH_SEGUNDOS
+        self.timer.setInterval(int(target_interval * 1000))
+        self._start_snapshot_worker()
 
+    @QtCore.Slot(object, float, float, str)
+    def _on_snapshot_ready(self, snap: Snapshot, build_ms: float, finished_ts: float, _view: str):
+        self._worker_busy = False
+        self.snapshot_build_ms = float(build_ms)
+        self.last_worker_finished_ts = float(finished_ts)
+        self._last_good_snapshot = snap
+        t0 = time.perf_counter()
+        signature = None
+        refresh_state = "PAUSADO" if self.paused else "ACTIVO"
+        self.lbl_refresh.setText(f"REFRESCO: {refresh_state}")
+        try:
+            signature = self._snapshot_signature(snap)
+            last = snap.last_update.astimezone(DISPLAY_TZ).strftime("%Y-%m-%d %H:%M:%S %Z") if snap.last_update else "--"
+            self.lbl_last.setText(f"ÚLTIMA ACT: {last}")
+            if signature == self._render_signature:
+                self.lbl_state.setText("STATE: IDLE")
+                return
+            self._render_signature = signature
+        except Exception:
+            snap.warnings.append("render prep error")
+            traceback.print_exc()
+
+        main_scale = "--"
+        main_y0, main_y1 = 0.0, 0.0
+        visible = pd.DataFrame(columns=["timestamp", "equity"])
+
+        # FASE 2 — Header crítico
+        try:
+            self.lbl_big.setText(_fmt_money(snap.saldo_actual))
             src = snap.source.upper().strip()
             self.lbl_source.setText(f"FUENTE: {src}")
             if src == "MAESTRO":
@@ -913,35 +1135,87 @@ class DashboardWindow(QtWidgets.QMainWindow):
                 self.lbl_source.setObjectName("BadgeBad"); self.lbl_big.setStyleSheet("color:#ffb9b9;")
             else:
                 self.lbl_source.setObjectName("BadgeNeutral"); self.lbl_big.setStyleSheet("color:#d8e7ff;")
-            self.lbl_source.style().unpolish(self.lbl_source); self.lbl_source.style().polish(self.lbl_source)
-
-            main_scale = self._update_plot_state(self.plot_states["main"], snap.series_main)
-            self._update_plot_state(self.plot_states["min"], snap.series_minutes)
-            self._update_plot_state(self.plot_states["hour"], snap.series_hours)
-            self._update_plot_state(self.plot_states["day"], snap.series_days)
-            self.lbl_scale.setText(f"ESCALA Y: {main_scale}")
             visible = _sanitize_series_for_plot(snap.series_main)
             n_visible = int(len(visible))
             if n_visible >= 1:
-                first = float(visible["equity"].iloc[0])
-                last_v = float(visible["equity"].iloc[-1])
+                first = float(visible["equity"].iloc[0]); last_v = float(visible["equity"].iloc[-1])
                 delta = last_v - first
                 pct = (delta / first * 100.0) if abs(first) > 1e-12 else 0.0
                 self.lbl_delta.setText(f"Δ VIS: {delta:+,.2f} USD ({pct:+.2f}%)")
             else:
                 self.lbl_delta.setText("Δ VIS: --")
             self.lbl_samples.setText(f"MUESTRAS: {n_visible}")
+            self.lbl_state.setText("STATE: DEGRADED" if self.degraded_mode_active else "STATE: LIVE")
+        except Exception:
+            snap.warnings.append("header render error")
+            traceback.print_exc()
 
+        # FASE 3 — Plots
+        try:
+            panel_items = [("main", snap.series_main)]
+            if not self.degraded_mode_active:
+                panel_items.extend([("min", snap.series_minutes), ("hour", snap.series_hours), ("day", snap.series_days)])
+            for key, series in panel_items:
+                try:
+                    scale_info, py0, py1 = self._update_plot_state(self.plot_states[key], series)
+                    if key == "main":
+                        main_scale = scale_info
+                        main_y0, main_y1 = py0, py1
+                except Exception as plot_err:
+                    snap.warnings.append(f"plot {key} con error: {plot_err}")
+            self.lbl_scale.setText(f"ESCALA Y: {main_scale}")
+        except Exception:
+            snap.warnings.append("plot phase error")
+            traceback.print_exc()
+
+        # FASE 4 — Métricas live (secundarias)
+        try:
+            metrics = self._compute_live_metrics(visible, snap)
+            rule = self._evaluate_live_rules(metrics, snap)
+            self.lbl_live_metrics.setText(str(metrics.get("text", "LIVE: --")))
+            self.lbl_rule.setText(f"RULE: {rule}")
+        except Exception:
+            self.lbl_live_metrics.setText("LIVE: --")
+            self.lbl_rule.setText("RULE: --")
+            snap.warnings.append("live metrics error")
+            traceback.print_exc()
+
+        # FASE 5 — Warnings / tooltip / perf
+        try:
+            self.render_ms = (time.perf_counter() - t0) * 1000.0
+            if self.snapshot_build_ms >= DEGRADED_WORKER_MS or self.render_ms >= DEGRADED_RENDER_MS:
+                if not self.degraded_mode_active:
+                    self.degraded_activations += 1
+                self.degraded_mode_active = True
+            elif self.consecutive_errors <= 0:
+                self.degraded_mode_active = False
+            perf_diag = (
+                f"worker_busy={self._worker_busy} skipped={self.skipped_refresh_count} "
+                f"build_ms={self.snapshot_build_ms:,.1f} render_ms={self.render_ms:,.1f} "
+                f"degraded={self.degraded_mode_active}"
+            )
             if snap.warnings:
-                compact = [w.strip()[:110] + ("…" if len(w.strip()) > 110 else "") for w in snap.warnings[:3]]
+                compact = [w.strip()[:100] + ("…" if len(w.strip()) > 100 else "") for w in snap.warnings[:3]]
                 self.lbl_warn.setText("⚠ " + " · ".join(compact))
-                self.lbl_warn.setToolTip("\n".join(snap.warnings + [f"Escala efectiva: {main_scale}"]))
+                self.lbl_warn.setToolTip("\n".join(snap.warnings + [perf_diag, f"Escala main: {Y_SCALE_MODE} | y=[{main_y0:,.2f}, {main_y1:,.2f}]"]))
             else:
                 self.lbl_warn.setText("")
-                self.lbl_warn.setToolTip(f"Escala efectiva: {main_scale}")
-        except Exception as e:
-            self.lbl_warn.setText(f"⚠ Error monitor: {e}")
+                self.lbl_warn.setToolTip(perf_diag + f"\nEscala main: {Y_SCALE_MODE} | y=[{main_y0:,.2f}, {main_y1:,.2f}]")
+            self.consecutive_errors = 0
+        except Exception:
             traceback.print_exc()
+
+    @QtCore.Slot(str)
+    def _on_snapshot_error(self, tb_text: str):
+        self._worker_busy = False
+        self.last_error_ts = time.time()
+        self.consecutive_errors += 1
+        if self.consecutive_errors >= DEGRADED_ERRORS_THRESHOLD:
+            self.degraded_mode_active = True
+        self.lbl_state.setText("STATE: ERROR")
+        self.lbl_warn.setText("⚠ Error en worker snapshot (se conserva último snapshot)")
+        self.lbl_warn.setToolTip(tb_text[-2000:])
+        print(tb_text)
 
 
 def main():
