@@ -8,8 +8,9 @@ Dependencias:
 Lectura de datos (prioridad REAL):
 1) saldo_real_live_history.jsonl (ruta compartida)
 2) saldo_real_live.json (snapshot maestro)
-3) LOG_SALDOS / *.log / *.txt (observado)
-4) registro_enriquecido_fulll*.csv (auxiliar)
+3) saldo_real_series.csv (fallback real)
+4) LOG_SALDOS / *.log / *.txt (observado)
+5) registro_enriquecido_fulll*.csv (auxiliar)
 """
 
 from __future__ import annotations
@@ -64,6 +65,7 @@ SALDO_LIVE_FILE = "saldo_real_live.json"
 SALDO_LIVE_HISTORY_FILE = "saldo_real_live_history.jsonl"
 SALDO_SERIES_CSV_FILE = "saldo_real_series.csv"
 DISPLAY_TIMEZONE = "America/Lima"
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 SALDO_LIVE_SHARED_PATH = os.path.abspath(
     os.getenv("SALDO_LIVE_SHARED_PATH", os.path.join(os.path.expanduser("~"), SALDO_LIVE_FILE))
 )
@@ -73,6 +75,13 @@ SALDO_LIVE_HISTORY_SHARED_PATH = os.path.abspath(
         os.path.join(os.path.dirname(SALDO_LIVE_SHARED_PATH), SALDO_LIVE_HISTORY_FILE),
     )
 )
+def resolver_ruta_saldo_series() -> str:
+    custom = os.getenv("SALDO_SERIES_CSV_PATH", "").strip()
+    if custom:
+        return os.path.abspath(os.path.expanduser(custom))
+    return os.path.abspath(os.path.join(SCRIPT_DIR, SALDO_SERIES_CSV_FILE))
+
+SALDO_SERIES_CSV_PATH = resolver_ruta_saldo_series()
 SALDO_LIVE_PATH = os.getenv("SALDO_LIVE_PATH", "").strip()
 
 MONITOR_VERSION = "v2026.03.31-r1"
@@ -86,9 +95,6 @@ Y_AXIS_MAX_USD = float(os.getenv("Y_AXIS_MAX_USD", "300"))
 Y_AUTO_SPAN_USD = float(os.getenv("Y_AUTO_SPAN_USD", "120"))
 CAPITAL_BASE_USD = float(os.getenv("CAPITAL_BASE_USD", "0") or "0")
 MIN_X_SPAN_SECONDS = 20.0
-DISPLAY_TZ = ZoneInfo(DISPLAY_TIMEZONE)
-
-
 def _safe_display_tz():
     if ZoneInfo is None:
         return timezone.utc
@@ -264,8 +270,6 @@ class DataEngine:
         if SALDO_LIVE_PATH:
             custom = Path(SALDO_LIVE_PATH).expanduser()
             cands.append(custom / SALDO_LIVE_FILE if custom.is_dir() else custom)
-        cands.append(self.base_dir / SALDO_LIVE_FILE)
-        cands.append(Path.cwd() / SALDO_LIVE_FILE)
         out: List[Path] = []
         seen = set()
         for p in cands:
@@ -289,12 +293,9 @@ class DataEngine:
         return out
 
     def _master_series_candidates(self) -> List[Path]:
-        base = Path(SALDO_LIVE_SHARED_PATH).expanduser().parent
-        cands: List[Path] = [Path(os.getenv("SALDO_SERIES_CSV_PATH", str(base / SALDO_SERIES_CSV_FILE))).expanduser()]
+        cands: List[Path] = [Path(SALDO_SERIES_CSV_PATH).expanduser()]
         for p in self._master_live_candidates():
             cands.append(p.parent / SALDO_SERIES_CSV_FILE)
-        cands.append(self.base_dir / SALDO_SERIES_CSV_FILE)
-        cands.append(Path.cwd() / SALDO_SERIES_CSV_FILE)
         out: List[Path] = []
         seen = set()
         for p in cands:
@@ -385,7 +386,7 @@ class DataEngine:
             (pd.DataFrame(columns=["timestamp", "equity"]), f"Sin histórico real: no se encontró {SALDO_LIVE_HISTORY_FILE} en ruta compartida: {SALDO_LIVE_HISTORY_SHARED_PATH}", None, None),
         )
 
-    def _read_master_series(self) -> Tuple[pd.DataFrame, Optional[str], Optional[Path]]:
+    def _read_saldo_series_csv(self) -> Tuple[pd.DataFrame, Optional[str], Optional[Path]]:
         paths = self._master_series_candidates()
         sig = self._sig(paths)
         cached = self._cached("series_csv", sig)
@@ -540,7 +541,7 @@ class DataEngine:
 
         master, master_msg, live_path_used = self._read_master_live() if view == "REAL" else (None, None, None)
         hist, hist_msg, hist_path_used, hist_growth_msg = self._read_master_history() if view == "REAL" else (pd.DataFrame(columns=["timestamp", "equity"]), None, None, None)
-        series_csv, series_msg, series_path_used = self._read_master_series() if view == "REAL" else (pd.DataFrame(columns=["timestamp", "equity"]), None, None)
+        series_csv, series_msg, series_path_used = self._read_saldo_series_csv() if view == "REAL" else (pd.DataFrame(columns=["timestamp", "equity"]), None, None)
         observed = self._parse_observed(view)
         estimated = self._build_estimated(view)
 
@@ -550,7 +551,6 @@ class DataEngine:
             warnings.append(hist_msg)
 
         if view == "REAL":
-            self._validate_balance_csvs(warnings)
             warnings.append(f"Monitor {MONITOR_VERSION} · id={MONITOR_BUILD_ID}")
             warnings.append(f"Ruta snapshot real: {live_path_used if live_path_used else SALDO_LIVE_SHARED_PATH}")
             warnings.append(f"Ruta histórico real: {hist_path_used if hist_path_used else SALDO_LIVE_HISTORY_SHARED_PATH}")
@@ -915,10 +915,19 @@ class DashboardWindow(QtWidgets.QMainWindow):
                 self.lbl_source.setObjectName("BadgeNeutral"); self.lbl_big.setStyleSheet("color:#d8e7ff;")
             self.lbl_source.style().unpolish(self.lbl_source); self.lbl_source.style().polish(self.lbl_source)
 
-            main_scale = self._update_plot_state(self.plot_states["main"], snap.series_main)
-            self._update_plot_state(self.plot_states["min"], snap.series_minutes)
-            self._update_plot_state(self.plot_states["hour"], snap.series_hours)
-            self._update_plot_state(self.plot_states["day"], snap.series_days)
+            main_scale = "--"
+            for key, series in (
+                ("main", snap.series_main),
+                ("min", snap.series_minutes),
+                ("hour", snap.series_hours),
+                ("day", snap.series_days),
+            ):
+                try:
+                    scale_info = self._update_plot_state(self.plot_states[key], series)
+                    if key == "main":
+                        main_scale = scale_info
+                except Exception as plot_err:
+                    snap.warnings.append(f"plot {key} con error: {plot_err}")
             self.lbl_scale.setText(f"ESCALA Y: {main_scale}")
             visible = _sanitize_series_for_plot(snap.series_main)
             n_visible = int(len(visible))
